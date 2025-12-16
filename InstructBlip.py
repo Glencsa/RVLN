@@ -116,7 +116,6 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         self.rgb_hidden_size = config.vision_config.hidden_size 
         self.depth_hidden_size = self.depth_backbone.config.hidden_size
         
-        # [修改点 1]：替换为 Cross Attention 融合模块
         # 注意：InstructBLIP 的 hidden size 较大 (1408)，head 数量选 8 或 16 都可以
         self.visual_fusion = DepthCrossAttentionFusion(
             rgb_dim=self.rgb_hidden_size,    # 1408
@@ -146,9 +145,6 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    # [修改点 2]：不再需要 _align_depth_to_rgb 函数
-    # Cross Attention 天然支持不同长度序列的交互，
-    # 只要 Depth 是 [B, N_depth, C] 格式即可。
         
     def forward_itm(self, pixel_values, input_ids, attention_mask):
             # 1. 提取 RGB 特征 (Semantic Tower)
@@ -173,8 +169,6 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
                 # depth_raw: [B, N_depth, 384]
                 depth_raw = depth_outputs.hidden_states[-1] 
                 
-                # <=== 【核心修复】 ===>
-                # 强制将 depth 输出转为和 rgb_embeds 一样的类型 (bfloat16)
                 if depth_raw.dtype != rgb_embeds.dtype:
                     depth_raw = depth_raw.to(rgb_embeds.dtype)
 

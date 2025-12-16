@@ -61,7 +61,7 @@ def run_inference():
 
     # data preparation
     print("\n准备测试图片...")
-    img_path = "test.jpeg"
+    img_path = "test7.jpg"
     
     if not os.path.exists(img_path):
         url = "http://images.cocodataset.org/val2017/000000039769.jpg"
@@ -83,7 +83,7 @@ def run_inference():
     inputs_gen["pixel_values"] = inputs_gen["pixel_values"].to(dtype=DTYPE)
     
     with torch.no_grad():
-        outputs = model.generate(**inputs_gen, max_new_tokens=50)
+        outputs = model.generate(**inputs_gen, max_new_tokens=500)
     
     print(f"Prompt: {prompt}")
     print(f"Output: {processor.batch_decode(outputs, skip_special_tokens=True)[0].strip()}")
@@ -96,9 +96,9 @@ def run_inference():
     print("="*40)
     
     test_texts = [
-        "Two cats sleeping on a pink blanket", 
+        "Imagine you are a robot, and the image shows your current perspective. Your task is to get to the bathroom. Tell me if going in this direction will get you to the bathroom.", 
         "A red sports car driving on the highway", 
-        "A man is taking a photo on the beach" 
+        "Imagine you are a robot, and the image shows your current perspective. Your task is to get to the living room and find the white chair. Tell me if going in this direction will get you to there." 
     ]
     
     image_inputs = processor(images=raw_image, return_tensors="pt").to(DEVICE)
