@@ -39,7 +39,7 @@ class DepthCrossAttentionFusion(nn.Module):
             nn.Linear(rgb_dim * 4, rgb_dim)
         )
         self.dropout = nn.Dropout(dropout)
-
+        self.decay_rate = 0.8
         self._init_weights()
 
     def _init_weights(self):
@@ -94,8 +94,11 @@ class DepthCrossAttentionFusion(nn.Module):
 class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
     def __init__(self, config: InstructBlipConfig):
         super().__init__(config)
-        
-        # ... (Depth Model 加载部分代码保持不变) ...
+        # 检查 Config 中是否包含必要的 token id，如果没有则报错提醒
+        if not hasattr(config, 'history_token_id') or config.history_token_id is None:
+            raise ValueError("Config must contain 'history_token_id'")
+        if not hasattr(config, 'current_token_id') or config.current_token_id is None:
+            raise ValueError("Config must contain 'current_token_id'")
         depth_model_name = "./Depth-Anything-V2-Small-hf"
         print(f"Loading Depth Backbone: {depth_model_name}...")
         self.depth_model = AutoModelForDepthEstimation.from_pretrained(depth_model_name)
@@ -107,7 +110,6 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         for param in self.depth_backbone.parameters():
             param.requires_grad = False
             
-        # ... (Register Buffers 保持不变) ...
         self.register_buffer("clip_mean", torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1))
         self.register_buffer("clip_std", torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1))
         self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
@@ -132,10 +134,7 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         )
         
         self._init_weights(self.itm_head)
-        # 融合模块内部已经有 init 逻辑，这里只需调用即可
-        # self.visual_fusion._init_weights() # 构造函数里已经调用了
 
-    # ... (_init_weights 函数保持不变) ...
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=0.02)
@@ -147,14 +146,13 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
 
         
     def forward_itm(self, pixel_values, input_ids, attention_mask):
-            # 1. 提取 RGB 特征 (Semantic Tower)
             rgb_outputs = self.vision_model(
                 pixel_values=pixel_values,
                 return_dict=True,
             )
             rgb_embeds = rgb_outputs.last_hidden_state # [B, N, 1408], 类型通常是 bfloat16
 
-            # 2. 提取 Depth 特征 (Geometric Tower)
+
             with torch.no_grad():
                 self.depth_backbone.eval()
                 
@@ -207,3 +205,201 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
             itm_logits = self.itm_head(pooled_features)
             
             return itm_logits
+    
+    def get_fused_visual_features(self, pixel_values, qformer_input_ids, qformer_attention_mask):
+        """
+        处理图像特征的核心函数：
+        输入 pixel_values: [Batch, Num_Images, 3, H, W]
+        返回: 拼接后的视觉 Query Tokens [Batch, Num_Images * Num_Queries, Hidden_Dim]
+        """
+        b, num_images, c, h, w = pixel_values.shape
+        
+        # 1. 展平 Batch 和 Num_Images 维度，以便并行处理所有图片
+        # [B*5, 3, H, W]
+        flat_pixel_values = pixel_values.view(b * num_images, c, h, w)
+        
+        # 2. RGB 特征提取 (Vision Tower)
+        rgb_outputs = self.vision_model(
+            pixel_values=flat_pixel_values,
+            return_dict=True,
+        )
+        rgb_embeds = rgb_outputs.last_hidden_state # [B*5, N_patches, 1408]
+
+        # 3. Depth 特征提取
+        with torch.no_grad():
+            self.depth_backbone.eval()
+            images_unnorm = flat_pixel_values * self.clip_std + self.clip_mean
+            depth_input = (images_unnorm - self.imagenet_mean) / self.imagenet_std
+            depth_outputs = self.depth_backbone(depth_input, output_hidden_states=True)
+            depth_raw = depth_outputs.hidden_states[-1] # [B*5, N_depth, 384]
+            if depth_raw.dtype != rgb_embeds.dtype:
+                depth_raw = depth_raw.to(rgb_embeds.dtype)
+
+        # 4. 融合 RGB 和 Depth
+        # [B*5, N_patches, 1408]
+        image_embeds = self.visual_fusion(rgb_embeds, depth_raw)
+        
+        # 5. 准备 Q-Former 输入
+        image_attention_mask = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=image_embeds.device)
+        
+        # 扩展 Query Tokens: [1, N_query, Dim] -> [B*5, N_query, Dim]
+        query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+        
+        # 扩展 Q-Former 的文本输入 (Instruction)
+        # 假设 Instruction 对这 5 张图都是一样的，我们需要将其复制 5 倍
+        # qformer_input_ids: [B, Seq_Len] -> [B, 1, Seq_Len] -> [B, 5, Seq_Len] -> [B*5, Seq_Len]
+        flat_qformer_input_ids = qformer_input_ids.unsqueeze(1).repeat(1, num_images, 1).view(b * num_images, -1)
+        flat_qformer_attention_mask = qformer_attention_mask.unsqueeze(1).repeat(1, num_images, 1).view(b * num_images, -1)
+
+        # Q-Former 内部的 Attention Mask 构造
+        query_attention_mask = torch.ones(
+            (b * num_images, query_tokens.shape[1]),
+            dtype=torch.long,
+            device=image_embeds.device
+        )
+        # [B*5, N_query + Seq_Len]
+        qformer_attention_mask_full = torch.cat([query_attention_mask, flat_qformer_attention_mask], dim=1)
+        
+        # 6. Q-Former 前向传播
+        query_outputs = self.qformer(
+            input_ids=flat_qformer_input_ids,
+            attention_mask=qformer_attention_mask_full,
+            query_embeds=query_tokens,
+            encoder_hidden_states=image_embeds,
+            encoder_attention_mask=image_attention_mask,
+            return_dict=True,
+        )
+        
+        # [B*5, N_query, Dim]
+        qformer_output = query_outputs.last_hidden_state
+        
+
+        # 7. 维度重组与拼接
+        # [B*5, N_query, Dim] -> [B, 5, N_query, Dim]
+        qformer_output = qformer_output.view(b, num_images, qformer_output.shape[1], qformer_output.shape[2])
+        
+
+        _, num_frames, _, _ = qformer_output.shape
+        decay_factors = torch.tensor([self.decay_rate ** (num_frames - 1 - i) for i in range(num_frames)])
+        # decay_factors becomes [0.8^4, 0.8^3, 0.8^2, 0.8^1, 1.0]
+
+        # 扩展维度以匹配 token
+        decay_factors = decay_factors.view(1, num_frames, 1, 1).to(qformer_output.device)
+
+        # 执行加权
+        qformer_output = qformer_output * decay_factors
+
+        # [B, 5 * N_query, Dim] -> 这就是拼接了 5 张图特征的长序列
+        visual_features = qformer_output.view(b, -1, qformer_output.shape[-1])
+        history_feats = visual_features[:, :4, :, :].flatten(1, 2)
+        current_feats = visual_features[:, 4:, :, :].flatten(1, 2)
+        return history_feats, current_feats
+    def _replace_image_tokens(self, inputs_embeds, input_ids, history_feats, current_feats, history_token_id, current_token_id):
+            """
+            核心替换逻辑：找到 input_ids 中的特殊 token 并填入视觉特征
+            """
+            batch_size = inputs_embeds.shape[0]
+            
+            # --- 处理 History Token ---
+            # 创建 Mask: [B, Seq_Len, 1]
+            history_mask = (input_ids == history_token_id).unsqueeze(-1)
+            
+            # 检查数量是否匹配 (这是一个很好的 Debug 步骤)
+            # 每个样本应该有 (4 * num_query_tokens) 个 history token
+            num_hist_tokens = history_mask.sum()
+            expected_hist_tokens = history_feats.shape[0] * history_feats.shape[1] # B * (4*N)
+            
+            if num_hist_tokens == expected_hist_tokens:
+                # 展平特征以匹配 mask 中 True 的总数
+                # masked_scatter_ 或者直接索引赋值 inputs_embeds[mask] = flat_feats
+                # 注意：inputs_embeds[history_mask.squeeze(-1)] 会得到一个 1D (Total_True, Dim) 的 view
+                inputs_embeds.masked_scatter_(history_mask, history_feats.flatten(0, 1))
+            else:
+                print(f"Warning: History token count mismatch! Found {num_hist_tokens}, expected {expected_hist_tokens}")
+                # 如果不匹配，这里可以选择报错，或者不做替换(但这会导致模型训练失败)
+
+            # --- 处理 Current Token ---
+            current_mask = (input_ids == current_token_id).unsqueeze(-1)
+            
+            num_curr_tokens = current_mask.sum()
+            expected_curr_tokens = current_feats.shape[0] * current_feats.shape[1] # B * N
+            
+            if num_curr_tokens == expected_curr_tokens:
+                inputs_embeds.masked_scatter_(current_mask, current_feats.flatten(0, 1))
+            else:
+                print(f"Warning: Current token count mismatch! Found {num_curr_tokens}, expected {expected_curr_tokens}")
+
+            return inputs_embeds
+    def forward(
+            self,
+            pixel_values: torch.FloatTensor,
+            qformer_input_ids: torch.LongTensor,
+            qformer_attention_mask: torch.LongTensor,
+            input_ids: torch.LongTensor,
+            attention_mask: torch.LongTensor = None,
+            labels: torch.LongTensor = None,
+            **kwargs
+        ):
+            # 1. 获取拆分后的视觉特征
+            # history_feats: [B, 4*N, D], current_feats: [B, N, D]
+            history_feats, current_feats = self.get_fused_visual_features(
+                pixel_values, qformer_input_ids, qformer_attention_mask
+            )
+            history_token_id = self.config.history_token_id
+            current_token_id = self.config.current_token_id
+            # 2. 获取初始文本 Embeddings
+            inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
+            
+            # 3. 执行“挖空填词”：将视觉特征填入对应的 token 位置
+            inputs_embeds = self._replace_image_tokens(
+                inputs_embeds, input_ids, 
+                history_feats, current_feats, 
+                history_token_id, current_token_id
+            )
+            
+            # 4. Standard Forward
+            if attention_mask is None:
+                attention_mask = torch.ones(input_ids.shape, device=input_ids.device)
+
+            return self.language_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                labels=labels,
+                return_dict=True,
+                **kwargs
+            )
+
+    @torch.no_grad()
+    def generate(
+        self,
+        pixel_values: torch.FloatTensor,
+        qformer_input_ids: torch.LongTensor,
+        qformer_attention_mask: torch.LongTensor,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.LongTensor = None,
+        **generate_kwargs
+    ):
+        # 1. 获取特征
+        history_feats, current_feats = self.get_fused_visual_features(
+            pixel_values, qformer_input_ids, qformer_attention_mask
+        )
+        history_token_id = self.config.history_token_id
+        current_token_id = self.config.current_token_id
+        # 2. 准备 Embeddings
+        inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
+        
+        # 3. 替换特征
+        inputs_embeds = self._replace_image_tokens(
+            inputs_embeds, input_ids, 
+            history_feats, current_feats, 
+            history_token_id, current_token_id
+        )
+        
+        if attention_mask is None:
+            attention_mask = torch.ones(input_ids.shape, device=input_ids.device)
+
+        return self.language_model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            **generate_kwargs
+        )
