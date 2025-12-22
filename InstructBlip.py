@@ -132,7 +132,7 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
             nn.ReLU(),
             nn.Linear(512, 2) 
         )
-        
+        self.decay_rate = 0.8
         self._init_weights(self.itm_head)
 
     def _init_weights(self, module):
@@ -262,74 +262,86 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         
         # 6. Q-Former 前向传播
         query_outputs = self.qformer(
-            input_ids=flat_qformer_input_ids,
-            attention_mask=qformer_attention_mask_full,
-            query_embeds=query_tokens,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_attention_mask,
-            return_dict=True,
-        )
+                    input_ids=flat_qformer_input_ids,
+                    attention_mask=qformer_attention_mask_full,
+                    query_embeds=query_tokens,
+                    encoder_hidden_states=image_embeds,
+                    encoder_attention_mask=image_attention_mask,
+                    return_dict=True,
+                )
         
-        # [B*5, N_query, Dim]
+        # [B*5, Seq_Len_Total, Dim] 
+        # Seq_Len_Total = 32 (Query) + Text_Len (Instruction)
         qformer_output = query_outputs.last_hidden_state
+        # =======================================================
+        # 【核心修复】: 必须只取前 num_query_tokens 个特征！！！
+        # 通常是前 32 个。我们用 query_tokens.shape[1] 来动态获取这个值。
+        # =======================================================
+        num_queries = self.query_tokens.shape[1] # 通常是 32
+        qformer_output = qformer_output[:, :num_queries, :] 
+        qformer_output = self.language_projection(qformer_output)
+        # 此时 qformer_output 形状变为 [B*5, 32, Dim]
         
-
         # 7. 维度重组与拼接
-        # [B*5, N_query, Dim] -> [B, 5, N_query, Dim]
-        qformer_output = qformer_output.view(b, num_images, qformer_output.shape[1], qformer_output.shape[2])
+        # [B*5, 32, Dim] -> [B, 5, 32, Dim]
+        qformer_output = qformer_output.view(b, num_images, num_queries, qformer_output.shape[-1])
         
-
+        # ... (后面的 decay 和 split 逻辑保持不变) ...
         _, num_frames, _, _ = qformer_output.shape
         decay_factors = torch.tensor([self.decay_rate ** (num_frames - 1 - i) for i in range(num_frames)])
-        # decay_factors becomes [0.8^4, 0.8^3, 0.8^2, 0.8^1, 1.0]
-
-        # 扩展维度以匹配 token
         decay_factors = decay_factors.view(1, num_frames, 1, 1).to(qformer_output.device)
-
-        # 执行加权
         qformer_output = qformer_output * decay_factors
 
-        # [B, 5 * N_query, Dim] -> 这就是拼接了 5 张图特征的长序列
-        visual_features = qformer_output.view(b, -1, qformer_output.shape[-1])
-        history_feats = visual_features[:, :4, :, :].flatten(1, 2)
-        current_feats = visual_features[:, 4:, :, :].flatten(1, 2)
+        # 这里的切片逻辑也不需要变了，直接用
+        history_feats = qformer_output[:, :4, :, :].flatten(1, 2)
+        current_feats = qformer_output[:, 4:, :, :].flatten(1, 2)
+        
         return history_feats, current_feats
     def _replace_image_tokens(self, inputs_embeds, input_ids, history_feats, current_feats, history_token_id, current_token_id):
-            """
-            核心替换逻辑：找到 input_ids 中的特殊 token 并填入视觉特征
-            """
-            batch_size = inputs_embeds.shape[0]
+        
+        # 1. 强制类型转换 (保持上一步的修复)
+        history_feats = history_feats.to(inputs_embeds.dtype)
+        current_feats = current_feats.to(inputs_embeds.dtype)
+        
+        # 2. 准备特征
+        # [Batch * Total_Hist_Tokens, Dim]
+        flat_hist_feats = history_feats.flatten(0, 1)
+        flat_curr_feats = current_feats.flatten(0, 1)
+        
+        # --- 处理 History Token ---
+        history_mask = (input_ids == history_token_id) # [B, Seq_Len]
+        
+        # 获取所有需要填坑的索引位置
+        # nonzero() 返回 [N, 2] 的索引矩阵 (dim0=batch_idx, dim1=seq_idx)
+        hist_indices = torch.nonzero(history_mask)
+        
+        # 【核心修复】：安全填入
+        # 取 "坑的数量" 和 "萝卜的数量" 的最小值，防止越界
+        num_hist_fill = min(hist_indices.shape[0], flat_hist_feats.shape[0])
+        
+        if num_hist_fill > 0:
+            # 只取前 num_hist_fill 个索引进行赋值
+            # 这样即使坑比萝卜多，我也只填前几个坑；如果萝卜比坑多，我也只用前几个萝卜
+            # 从而完美避免 CUDA 越界
+            target_indices = hist_indices[:num_hist_fill]
+            source_feats = flat_hist_feats[:num_hist_fill]
             
-            # --- 处理 History Token ---
-            # 创建 Mask: [B, Seq_Len, 1]
-            history_mask = (input_ids == history_token_id).unsqueeze(-1)
-            
-            # 检查数量是否匹配 (这是一个很好的 Debug 步骤)
-            # 每个样本应该有 (4 * num_query_tokens) 个 history token
-            num_hist_tokens = history_mask.sum()
-            expected_hist_tokens = history_feats.shape[0] * history_feats.shape[1] # B * (4*N)
-            
-            if num_hist_tokens == expected_hist_tokens:
-                # 展平特征以匹配 mask 中 True 的总数
-                # masked_scatter_ 或者直接索引赋值 inputs_embeds[mask] = flat_feats
-                # 注意：inputs_embeds[history_mask.squeeze(-1)] 会得到一个 1D (Total_True, Dim) 的 view
-                inputs_embeds.masked_scatter_(history_mask, history_feats.flatten(0, 1))
-            else:
-                print(f"Warning: History token count mismatch! Found {num_hist_tokens}, expected {expected_hist_tokens}")
-                # 如果不匹配，这里可以选择报错，或者不做替换(但这会导致模型训练失败)
+            # 使用索引赋值代替 masked_scatter_
+            inputs_embeds[target_indices[:, 0], target_indices[:, 1]] = source_feats
 
-            # --- 处理 Current Token ---
-            current_mask = (input_ids == current_token_id).unsqueeze(-1)
+        # --- 处理 Current Token ---
+        current_mask = (input_ids == current_token_id)
+        curr_indices = torch.nonzero(current_mask)
+        
+        num_curr_fill = min(curr_indices.shape[0], flat_curr_feats.shape[0])
+        
+        if num_curr_fill > 0:
+            target_indices = curr_indices[:num_curr_fill]
+            source_feats = flat_curr_feats[:num_curr_fill]
             
-            num_curr_tokens = current_mask.sum()
-            expected_curr_tokens = current_feats.shape[0] * current_feats.shape[1] # B * N
-            
-            if num_curr_tokens == expected_curr_tokens:
-                inputs_embeds.masked_scatter_(current_mask, current_feats.flatten(0, 1))
-            else:
-                print(f"Warning: Current token count mismatch! Found {num_curr_tokens}, expected {expected_curr_tokens}")
+            inputs_embeds[target_indices[:, 0], target_indices[:, 1]] = source_feats
 
-            return inputs_embeds
+        return inputs_embeds
     def forward(
             self,
             pixel_values: torch.FloatTensor,

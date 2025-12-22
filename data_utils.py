@@ -86,22 +86,22 @@ class InstructBlipLoRADataset(Dataset):
         }
 
 class DataCollatorForInstructBlip:
-    def __init__(self, processor, tokenizer):
+    def __init__(self, processor, tokenizer, qformer_tokenizer): # <--- 新增参数 qformer_tokenizer
         self.processor = processor
         self.tokenizer = tokenizer
-        # 获取特殊 Token ID 用于 Padding
+        self.qformer_tokenizer = qformer_tokenizer # <--- 保存它
+        
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         self.ignore_index = -100
 
     def __call__(self, batch):
         # 1. 处理图像
-        # [B, 5, 3, H, W]
         pixel_values = torch.stack([item["pixel_values"] for item in batch])
         
         # 2. 处理 Q-Former 输入
-        # Q-Former 只需要文本指令，不需要那些占位符 tag，也不需要 GPT 的回答
+        # 【核心修复】：必须使用 qformer_tokenizer !!!
         qformer_prompts = [item["qformer_prompt"] for item in batch]
-        qformer_inputs = self.tokenizer(
+        qformer_inputs = self.qformer_tokenizer(  # <--- 修改这里，原来是 self.tokenizer
             qformer_prompts, 
             padding=True, 
             return_tensors="pt",
@@ -109,42 +109,31 @@ class DataCollatorForInstructBlip:
             max_length=512
         )
         
-        # 3. 处理 LLM 输入 (Input IDs & Labels)
+        # 3. 处理 LLM 输入 (保持不变，使用 self.tokenizer)
         llm_full_texts = [item["llm_full_text"] for item in batch]
-        
-        # Tokenize 整个 Batch
         llm_inputs = self.tokenizer(
             llm_full_texts,
             padding=True,
             return_tensors="pt",
             truncation=True,
-            max_length=1024, # 根据显存调整
-            add_special_tokens=False # 我们已经在 text 里加了 </s>
+            max_length=1024,
+            add_special_tokens=False
         )
         
         input_ids = llm_inputs.input_ids
         attention_mask = llm_inputs.attention_mask
         labels = input_ids.clone()
         
-        # 4. Mask 掉 User Prompt 部分 (只训练 GPT 回答的 loss)
+        # 4. Mask User Prompt (保持不变)
         for i, item in enumerate(batch):
             prompt = item["llm_prompt"]
-            # 对 prompt 进行 tokenize 来获取长度
             prompt_ids = self.tokenizer(
                 prompt, 
                 return_tensors="pt", 
                 add_special_tokens=False
             ).input_ids[0]
-            
             prompt_len = len(prompt_ids)
-            
-            # 这是一个近似方法。更严格的方法是逐个匹配 token。
-            # 但由于 input_ids 包含了 prompt_ids，我们直接把前 prompt_len 个设为 -100
-            # 注意：必须处理 padding 导致的前缀偏移 (Left Padding) 或者后缀 (Right Padding)
-            # Transformers 默认通常是 Right Padding
             labels[i, :prompt_len] = self.ignore_index
-            
-            # 同时也 Mask 掉 Padding 部分
             padding_mask = input_ids[i] == self.pad_token_id
             labels[i, padding_mask] = self.ignore_index
 

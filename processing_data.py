@@ -11,7 +11,7 @@ PADDING_IMAGE_PATH = './black.jpg' # 填充用的黑图路径
 # 【新增】设置 r2r_training_rgb 所在的新的根目录
 # 例如：如果你的图片实际在 /data/datasets/r2r_training_rgb/...
 # 这里就填 '/data/datasets/'
-NEW_IMAGE_ROOT = '/media/isvl/T7/vln_dataset'  # <--- 请在这里修改你的新路径前缀
+NEW_IMAGE_ROOT = '/media/isvl/Elements/'  # <--- 请在这里修改你的新路径前缀
 # ===========================================
 
 def create_black_padding_image(path):
