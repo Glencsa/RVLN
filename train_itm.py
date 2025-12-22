@@ -5,8 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
-from transformers import InstructBlipProcessor, BertTokenizer
-# 确保引入的是修改过的新版 Cross-Attention 模型
+from transformers import InstructBlipProcessor, BertTokenizer,InstructBlipConfig
+from transformers import AutoTokenizer
 from InstructBlip import InstructBlipMultiTask 
 import swanlab
 
@@ -174,6 +174,21 @@ if __name__ == "__main__":
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     # --- 模型与处理器加载 ---
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    special_tokens = {"additional_special_tokens": ["<history>", "<current>"]}
+    tokenizer.add_special_tokens(special_tokens)
+
+    hist_id = tokenizer.convert_tokens_to_ids("<history>")
+    curr_id = tokenizer.convert_tokens_to_ids("<current>")
+    print(f"Token IDs injected: History={hist_id}, Current={curr_id}")
+
+    # 3. 加载 Config 对象
+    config = InstructBlipConfig.from_pretrained(MODEL_NAME)
+
+    # 4. 【关键步骤】将 ID 手动写入 Config 对象
+    # 这一步必须在 model 初始化之前完成！
+    config.history_token_id = hist_id
+    config.current_token_id = curr_id
     print(f"Loading Processor from {MODEL_NAME}...")
     processor = InstructBlipProcessor.from_pretrained(MODEL_NAME)
     qformer_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
@@ -181,10 +196,13 @@ if __name__ == "__main__":
     print("Loading Dual-Tower Model...")
     model = InstructBlipMultiTask.from_pretrained(
         MODEL_NAME,
+        config=config,              
         torch_dtype=torch.bfloat16, 
         load_in_8bit=LOAD_IN_8BIT,
         device_map="auto" if LOAD_IN_8BIT else None
     )
+
+    model.language_model.resize_token_embeddings(len(tokenizer))
     if not LOAD_IN_8BIT:
         model.to(device)
 
