@@ -20,7 +20,7 @@ def run_inference():
     # 1. 基础配置
     # =================================================
     MODEL_ID = "./instructblip-vicuna-7b"
-    CHECKPOINT_PATH = "checkpoints_itm_cross_attn_with_depth/best_checkpoint.pth"
+    CHECKPOINT_PATH = "checkpoints_itm_cross_attn_with_depth_qformer_vit/latest_checkpoint.pth"
     
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     # ITM 推理建议使用 float16 或 bfloat16
@@ -62,10 +62,16 @@ def run_inference():
     if os.path.exists(CHECKPOINT_PATH):
         print(f"📥 加载权重: {CHECKPOINT_PATH}")
         checkpoint = torch.load(CHECKPOINT_PATH, map_location="cpu")
+        if 'depth_backbone' in checkpoint:
+            model.depth_backbone.load_state_dict(checkpoint['depth_backbone'], strict=True)
         if 'visual_fusion' in checkpoint:
             model.visual_fusion.load_state_dict(checkpoint['visual_fusion'], strict=True)
         if 'itm_head' in checkpoint:
             model.itm_head.load_state_dict(checkpoint['itm_head'], strict=True)
+        if 'qformer' in checkpoint:
+            model.qformer.load_state_dict(checkpoint['qformer'], strict=True)
+        if 'query_tokens' in checkpoint:
+            model.query_tokens.data = checkpoint['query_tokens'].data
     else:
         print("⚠️ 未找到权重，使用随机初始化参数！")
 
@@ -110,7 +116,7 @@ def run_inference():
     test_texts = [
         "A photo of two cats sleeping on a pink blanket.",  # 这里的描述请根据你的测试图修改
         "A view of a modern kitchen with a refrigerator.",
-        "Find the toilet in the bathroom."
+        "Find the toilet."
     ]
     
     # 【关键步骤】数据对齐

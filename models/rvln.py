@@ -85,7 +85,7 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         print(f"Loading Depth Encoder: {depth_encoder_name}...")
         self.depth_backbone = ViTModel.from_pretrained(depth_encoder_name, add_pooling_layer=False)
         
-        # 冻结深度编码器 (可选，视你的数据量而定，通常建议冻结)
+        # 冻结深度编码器参数
         for param in self.depth_backbone.parameters():
             param.requires_grad = False
             
@@ -347,15 +347,15 @@ class InstructBlipMultiTask(InstructBlipForConditionalGeneration):
         # 确保类型一致 (转为 depth backbone 的 dtype，通常是 float32 或 bfloat16)
         flat_depth_values = flat_depth_values.to(dtype=self.depth_backbone.dtype)
 
-        with torch.no_grad():
-            self.depth_backbone.eval()
-            # 通过 ViT Encoder
-            depth_outputs = self.depth_backbone(pixel_values=flat_depth_values, return_dict=True)
-            depth_raw = depth_outputs.last_hidden_state # [B_flat, N_patches, 768]
-            
-            # 确保与 RGB 特征类型一致以便融合
-            if depth_raw.dtype != rgb_embeds.dtype:
-                depth_raw = depth_raw.to(rgb_embeds.dtype)
+        # with torch.no_grad():
+        # self.depth_backbone.eval()
+        # 通过 ViT Encoder
+        depth_outputs = self.depth_backbone(pixel_values=flat_depth_values, return_dict=True)
+        depth_raw = depth_outputs.last_hidden_state # [B_flat, N_patches, 768]
+        
+        # 确保与 RGB 特征类型一致以便融合
+        if depth_raw.dtype != rgb_embeds.dtype:
+            depth_raw = depth_raw.to(rgb_embeds.dtype)
 
         # 4. Cross Attention 融合
         image_embeds = self.visual_fusion(rgb_embeds, depth_raw)

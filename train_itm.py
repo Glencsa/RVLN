@@ -161,7 +161,7 @@ if __name__ == "__main__":
         "model_name": "./instructblip-vicuna-7b",
         "data_root": "./flickr_30k",
         "batch_size": 32,
-        "lr_head": 5e-5,
+        "lr_head": 5e-6,
         "lr_fusion": 1e-4, 
         "epochs": 10,
         "load_in_8bit": False,
@@ -179,10 +179,10 @@ if __name__ == "__main__":
     DATA_ROOT = "./flickr_30k"
     IMAGE_ROOT = os.path.join(DATA_ROOT, "flickr30k-images")
     CAPTION_FILE = os.path.join(DATA_ROOT, "captions_clean.token")
-    CHECKPOINT_DIR = "./checkpoints_itm_cross_attn_with_depth" 
+    CHECKPOINT_DIR = "./checkpoints_itm_cross_attn_with_depth_qformer_vit_v1" 
     
     LOAD_IN_8BIT = False 
-    BATCH_SIZE = 32     
+    BATCH_SIZE = 16     
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -221,7 +221,7 @@ if __name__ == "__main__":
         model.to(device)
 
     # --- 冻结/解冻参数 ---
-    trainable_modules = ["itm_head", "visual_fusion"] 
+    trainable_modules = ["itm_head", "visual_fusion","qformer", "query_tokens", "depth_backbone"] 
     for name, param in model.named_parameters():
         if any(m in name for m in trainable_modules):
             param.requires_grad = True
@@ -291,6 +291,7 @@ if __name__ == "__main__":
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
+
             # 计算梯度范数
             fusion_grad_norm = 0.0
             for p in model.visual_fusion.parameters():
@@ -298,6 +299,24 @@ if __name__ == "__main__":
                     fusion_grad_norm += p.grad.data.norm(2).item() ** 2
             fusion_grad_norm = fusion_grad_norm ** 0.5
 
+            depth_grad_norm = 0.0
+            for p in model.depth_backbone.parameters():
+                if p.grad is not None:
+                    depth_grad_norm += p.grad.data.norm(2).item() ** 2
+            depth_grad_norm = depth_grad_norm ** 0.5
+
+
+            qformer_grad_norm = 0.0
+            for p in model.qformer.parameters():
+                if p.grad is not None:
+                    qformer_grad_norm += p.grad.data.norm(2).item() ** 2
+            qformer_grad_norm = qformer_grad_norm ** 0.5
+
+
+            if model.query_tokens.grad is not None:
+                tokens_grad_norm = model.query_tokens.grad.data.norm(2).item()
+            else:
+                tokens_grad_norm = 0.0
             optimizer.step()
             
             # 记录日志
@@ -310,19 +329,26 @@ if __name__ == "__main__":
                 "train/loss": loss_val,
                 "train/acc": acc,
                 "train/lr": optimizer.param_groups[0]['lr'],
-                "train/fusion_grad_norm": fusion_grad_norm
+                "train/fusion_grad_norm": fusion_grad_norm,
+                "train/depth_grad_norm": depth_grad_norm,
+                "train/qformer_grad_norm": qformer_grad_norm,
+                "train/tokens_grad_norm": tokens_grad_norm
             })
             
             if step % 5 == 0:
                 print(f"[Epoch {epoch+1}][Step {step}] Train Loss: {loss_val:.4f}, Acc: {acc:.4f}")
 
-            # 定期保存普通 Checkpoint
             if global_step % save_every_steps == 0:
                 ckpt_path = os.path.join(CHECKPOINT_DIR, "latest_checkpoint.pth")
+                # [修改] 增加 qformer 和 query_tokens 的保存
                 torch.save({
                     "visual_fusion": model.visual_fusion.state_dict(),
-                    "itm_head": model.itm_head.state_dict()
+                    "itm_head": model.itm_head.state_dict(),
+                    "qformer": model.qformer.state_dict(),
+                    "query_tokens": model.query_tokens,
+                    "depth_backbone": model.depth_backbone.state_dict()
                 }, ckpt_path)
+                print(f"Saved checkpoint to {ckpt_path}")
 
         scheduler.step()
         
@@ -340,11 +366,15 @@ if __name__ == "__main__":
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_path = os.path.join(CHECKPOINT_DIR, "best_checkpoint.pth")
+            # [修改] 增加 qformer 和 query_tokens 的保存
             torch.save({
                 "epoch": epoch,
                 "val_acc": val_acc,
                 "visual_fusion": model.visual_fusion.state_dict(),
-                "itm_head": model.itm_head.state_dict()
+                "itm_head": model.itm_head.state_dict(),
+                "qformer": model.qformer.state_dict(),
+                "query_tokens": model.query_tokens,
+                "depth_backbone": model.depth_backbone.state_dict()
             }, best_path)
             print(f"🏆 New Best Model Saved! Val Acc: {val_acc:.4f}")
 
