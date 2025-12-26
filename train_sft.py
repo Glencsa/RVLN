@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.nn as nn
 from transformers import (
     InstructBlipProcessor,
     InstructBlipConfig,
@@ -10,18 +11,16 @@ from transformers import (
 from peft import (
     LoraConfig,
     get_peft_model,
-    prepare_model_for_kbit_training,
     TaskType
 )
 
-# 假设你的代码保存在这些文件中
-from models.InstructBlip import InstructBlipMultiTask  # 你提供的模型类
-from data_utils import InstructBlipLoRADataset, DataCollatorForInstructBlip # 你提供的数据集类
+# 引入你的自定义模块
+from models.InstructBlip import InstructBlipMultiTask 
+# 引入你上面提供的 Dataset 和 Collator 类
+from data_utils import InstructBlipLoRADataset, DataCollatorForInstructBlip 
 
 def print_trainable_parameters(model):
-    """
-    打印模型中可训练参数的数量
-    """
+    """打印可训练参数统计"""
     trainable_params = 0
     all_param = 0
     for _, param in model.named_parameters():
@@ -33,121 +32,159 @@ def print_trainable_parameters(model):
         f"trainable%: {100 * trainable_params / all_param:.2f}"
     )
 
+# ==========================================
+# 1. 修正 Data Collator 以匹配模型输入
+# ==========================================
+class DataCollatorWrapper(DataCollatorForInstructBlip):
+    """
+    包装你原本的 Collator，将输出的键名修改为模型 forward 函数需要的名字
+    pixel_values_rgb -> pixel_values
+    pixel_values_depth -> depth_pixel_values
+    """
+    def __call__(self, batch):
+        outputs = super().__call__(batch)
+        
+        # 重命名键值以匹配 InstructBlipMultiTask.forward 的参数
+        if "pixel_values_rgb" in outputs:
+            outputs["pixel_values"] = outputs.pop("pixel_values_rgb")
+        
+        if "pixel_values_depth" in outputs:
+            outputs["depth_pixel_values"] = outputs.pop("pixel_values_depth")
+            
+        return outputs
+
+# ==========================================
+# 2. 自定义 Trainer (确保保存 Embeddings)
+# ==========================================
+class CustomTrainer(Trainer):
+    def save_model(self, output_dir=None, _internal_call=False):
+        """重写保存逻辑，确保 LoRA + Embeddings + Tokenizer 都能被保存"""
+        if output_dir is None:
+            output_dir = self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 1. 保存 LoRA 和 modules_to_save (embed_tokens)
+        super().save_model(output_dir, _internal_call)
+        
+        # 2. 保存 Tokenizer
+        self.tokenizer.save_pretrained(output_dir)
+        
+        print(f"✅ Model (LoRA + Embeddings) saved to {output_dir}")
+
 def main():
     # =================Configuration=================
-    # 基础模型路径 (可以是本地路径或 huggingface hub id)
-    # 例如: "Salesforce/instructblip-vicuna-7b"
     model_name_or_path = "./instructblip-vicuna-7b" 
-    data_path = "/home/isvl/guan_code/RVLN/dataset_instructblip.json"
-    output_dir = "./output/instructblip_depth_lora"
+    # 之前训练好的 Stage 1 权重路径 (包含 Fusion, Q-Former, Depth 等)
+    stage1_checkpoint = "checkpoints_itm_cross_attn_with_depth_qformer_vit_v1/latest_checkpoint.pth"
     
-    # 训练超参数
-    batch_size = 2 # 根据显存调整 (InstructBlip 显存占用较大)
-    grad_accumulation = 4
-    learning_rate = 1e-4 # LoRA 学习率通常比全量微调大一点
+    data_path = "/home/isvl/guan_code/RVLN/datasets/filtered_traj_3279.json"
+    output_dir = "./output/instructblip_sft_llm"
+    
+    # 训练参数
+    batch_size = 2 
+    grad_accumulation = 8 # 稍微加大累积，模拟更大 batch
+    learning_rate = 5e-5  # SFT LLM 学习率
     num_epochs = 3
     
     # =================1. Processor & Tokenizer=================
-    print("Loading Processor and Tokenizer...")
+    print("Loading Processor...")
     processor = InstructBlipProcessor.from_pretrained(model_name_or_path)
     tokenizer = processor.tokenizer
     qformer_tokenizer = processor.qformer_tokenizer
 
+    # 添加特殊 Token
     special_tokens_dict = {'additional_special_tokens': ["<history>", "<current>"]}
-    num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
-    print(f"Added {num_added_toks} special tokens.")
+    tokenizer.add_special_tokens(special_tokens_dict)
     
-    # 获取 Token ID 以便传入模型 Config
     history_token_id = tokenizer.convert_tokens_to_ids("<history>")
     current_token_id = tokenizer.convert_tokens_to_ids("<current>")
 
     # =================2. Model Initialization=================
-    print("Loading Model Config...")
+    print("Loading Base Model...")
     config = InstructBlipConfig.from_pretrained(model_name_or_path)
-    
-    # 将特殊 Token ID 注入 Config (你的模型类中做了检查)
     config.history_token_id = history_token_id
     config.current_token_id = current_token_id
 
-    print("Loading Model (this may take a while)...")
-    # 如果显存不够，可以考虑添加 load_in_8bit=True 或 load_in_4bit=True
-    # 这里演示加载 float16/bfloat16
+    # 加载基础模型
     model = InstructBlipMultiTask.from_pretrained(
         model_name_or_path,
         config=config,
-        torch_dtype=torch.bfloat16, # 建议使用 bfloat16
+        torch_dtype=torch.bfloat16,
         device_map="auto"
     )
 
-    # 极其重要：因为添加了新 Token，必须调整 Embedding 层大小
+    # 调整 Embedding 大小 (必须在加载 Stage 1 权重前做，否则维度对不上)
     model.language_model.resize_token_embeddings(len(tokenizer))
 
-    # =================3. Freeze & LoRA Setup=================
-    # 策略：
-    # 1. 冻结所有参数
-    # 2. 解冻新加入的模块 (visual_fusion, itm_head)
-    # 3. 对 LLM 应用 LoRA
+    # =================3. [关键] 加载 Stage 1 训练好的权重=================
+    if os.path.exists(stage1_checkpoint):
+        print(f"📥 Loading Stage 1 Checkpoint from: {stage1_checkpoint}")
+        ckpt = torch.load(stage1_checkpoint, map_location="cpu")
+        
+        # 加载各个模块
+        msg = model.load_state_dict(ckpt, strict=False) 
+        # strict=False 是必须的，因为 ckpt 里可能没有 LLM 的权重，只有 fusion/qformer 等
+        print(f"Checkpoint Load Status: {msg}")
+        
+        # 验证关键模块是否加载 (简单检查 key)
+        if 'visual_fusion' in ckpt: print(" - Visual Fusion Loaded ✅")
+        if 'qformer' in ckpt: print(" - Q-Former Loaded ✅")
+        if 'depth_backbone' in ckpt: print(" - Depth Backbone Loaded ✅")
+        
+        # ⚠️ 重要：如果 Stage 1 训练时也 resize 了 embedding 并且保存了，
+        # 这里的 load_state_dict 可能会覆盖掉刚刚 resize 的 embedding。
+        # 如果 Stage 1 没保存 LLM embedding，则这里是从头训练 embedding。
+    else:
+        print("❌ Warning: Stage 1 checkpoint not found! Training from scratch (Not Recommended).")
+
+    # =================4. Freeze & LoRA Setup=================
     
-    # 3.1 冻结所有
+    # 4.1 全局冻结
     for param in model.parameters():
         param.requires_grad = False
         
-    # 3.2 解冻自定义模块 (必须全量训练，因为是随机初始化的)
-    # 注意：depth_backbone 在你的 init 代码里已经设为 False 了
-    for name, param in model.named_parameters():
-        if "visual_fusion" in name or "itm_head" in name:
-            param.requires_grad = True
-            # 确保这些层是 float32 (可选，为了数值稳定性) 或者跟随模型 dtype
-            # param.data = param.data.to(torch.float32) 
-
-    # 3.3 配置 LoRA 针对 LLM
-    # InstructBlip-Vicuna 的 LLM 是 Llama 架构
-    # Target modules 通常是 q_proj, v_proj (attention)
+    # 4.2 配置 LoRA (针对 LLM)
     peft_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"], # 针对 LLM 的 Attention 层
+        r=32, # 稍微加大 rank 以提升 LLM 表现
+        lora_alpha=64,
+        # 针对 Vicuna/Llama 的所有线性层
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_dropout=0.05,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
-        modules_to_save=["embed_tokens", "lm_head"] # 如果词表扩充了，通常建议训练 embedding
+        # ⚠️ 关键：因为加了新 token，必须训练 Embedding 层和 Head
+        modules_to_save=["embed_tokens", "lm_head"] 
     )
-    
-    # 将 LoRA 应用于 language_model
-    # 注意：InstructBlipMultiTask -> language_model (Llama)
-    # 我们需要手动包装 language_model，或者直接对整个 model 调 get_peft_model
-    # 但直接对整个 model 调可能会影响到不需要 LoRA 的部分。
-    # 标准做法：只对 LLM 加 LoRA。
     
     print("Applying LoRA to LLM...")
     model.language_model = get_peft_model(model.language_model, peft_config)
     
-    # 再次确保自定义模块是可训练的 (get_peft_model 可能会重置部分状态)
-    for name, param in model.named_parameters():
-        if "visual_fusion" in name or "itm_head" in name:
-            param.requires_grad = True
-
-    # 打印可训练参数情况
+    # 4.3 确认其他部分保持冻结
+    # 在 SFT 阶段，通常我们冻结视觉部分（Fusion, QFormer, Depth），只调 LLM。
+    # 这样可以防止 LLM 的梯度破坏已经对齐好的视觉特征。
+    # 如果你想继续微调 Fusion，可以在这里解冻它，但通常不建议同时做。
+    
     print_trainable_parameters(model)
 
-    # =================4. Dataset Loading=================
+    # =================5. Data Setup=================
     print("Loading Dataset...")
     train_dataset = InstructBlipLoRADataset(
         data_path=data_path,
         processor=processor,
         tokenizer=tokenizer,
-        image_root="",
+        image_root="", # 填入你的图片根目录
         history_len=4,
         current_len=1
     )
     
-    collator = DataCollatorForInstructBlip(
-            processor=processor,
-            tokenizer=tokenizer,
-            qformer_tokenizer=qformer_tokenizer # <--- 传入这里
-        )
+    # 使用 Wrapper 后的 Collator
+    collator = DataCollatorWrapper(
+        processor=processor,
+        tokenizer=tokenizer,
+        qformer_tokenizer=qformer_tokenizer
+    )
 
-    # =================5. Trainer Setup=================
+    # =================6. Trainer Setup=================
     training_args = TrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
@@ -156,38 +193,26 @@ def main():
         logging_steps=10,
         save_strategy="epoch",
         num_train_epochs=num_epochs,
-        bf16=True, # 推荐开启 BF16
-        remove_unused_columns=False, # 必须设为 False，否则 Trainer 会过滤掉 pixel_values 等非标准参数
+        bf16=True,
+        remove_unused_columns=False,
         report_to="tensorboard",
-        ddp_find_unused_parameters=False, # 如果有多余的参数未参与计算设为 True
+        save_total_limit=2,
     )
 
-    trainer = Trainer(
+    # 使用自定义 Trainer
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         data_collator=collator,
+        tokenizer=tokenizer
     )
 
-    # =================6. Start Training=================
-    print("Starting Training...")
+    # =================7. Training=================
+    print("Starting SFT Training...")
     trainer.train()
     
-    # =================7. Save Model=================
-    # 保存 LoRA 权重
-    trainer.model.language_model.save_pretrained(os.path.join(output_dir, "llm_lora"))
-    
-    # 保存自定义模块的权重 (因为它们不是 LoRA 的一部分，需手动保存)
-    custom_modules_path = os.path.join(output_dir, "custom_modules.pth")
-    custom_state_dict = {
-        k: v.cpu() for k, v in model.named_parameters() 
-        if ("visual_fusion" in k or "itm_head" in k)
-    }
-    torch.save(custom_state_dict, custom_modules_path)
-    print(f"Custom modules saved to {custom_modules_path}")
-    
-    # 保存 Tokenizer (因为添加了新 token)
-    tokenizer.save_pretrained(output_dir)
+    trainer.save_model(output_dir)
 
 if __name__ == "__main__":
     main()

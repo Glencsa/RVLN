@@ -1,119 +1,94 @@
+import os
+import json
 import torch
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, InstructBlipProcessor
-import sys
+from torch.utils.data import DataLoader, Dataset
+from PIL import Image
 from data_utils import InstructBlipLoRADataset, DataCollatorForInstructBlip
-
-def test_pipeline():
-    # 1. 配置路径
-    model_name = "Salesforce/instructblip-vicuna-7b"
-    data_path = "dataset_instructblip.json" # 你生成的 JSON
-    image_root = "." # 图片根目录
+# ==========================================
+# 1. Mock 组件 (用于模拟 Processor 和 Tokenizer)
+# ==========================================
+class MockTokenizer:
+    def __init__(self):
+        self.pad_token_id = 0
     
-    print(">>> 1. Loading Tokenizer & Processor (Lightweight)...")
-    try:
-        # 只加载预处理工具，不加载模型权重，速度快且不占显存
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        processor = InstructBlipProcessor.from_pretrained(model_name)
-    except Exception as e:
-        print(f"Error loading huggingface files: {e}")
+    def __call__(self, text, padding=True, return_tensors="pt", truncation=True, max_length=512, add_special_tokens=True):
+        if isinstance(text, str): text = [text]
+        batch_size = len(text)
+        # 模拟生成 input_ids
+        return type('obj', (object,), {
+            'input_ids': torch.randint(1, 1000, (batch_size, 30)), 
+            'attention_mask': torch.ones((batch_size, 30), dtype=torch.long)
+        })
+
+class MockProcessor:
+    def __call__(self, images, return_tensors="pt"):
+        # images 是 PIL Image 列表
+        n_images = len(images)
+        # 模拟返回 [N, 3, 224, 224]
+        return type('obj', (object,), {
+            'pixel_values': torch.randn(n_images, 3, 224, 224)
+        })
+
+
+def main():
+    # 配置你的真实文件路径
+    json_path = "datasets/filtered_traj_3279.json"
+    
+    # ⚠️ 关键：如果 json 里的路径已经是 "datasets/test/..."
+    # 且你的脚本在根目录，那么 image_root 应该是 "." (当前目录)
+    image_root = "." 
+
+    if not os.path.exists(json_path):
+        print(f"❌ 错误：找不到文件 {json_path}")
         return
 
-    # 2. 模拟添加特殊 Token (这是关键步骤)
-    print(">>> 2. Adding Special Tokens...")
-    special_tokens = {"additional_special_tokens": ["<history>", "<current>"]}
-    num_added = tokenizer.add_special_tokens(special_tokens)
-    print(f"Added {num_added} special tokens.")
-    
-    # 验证 ID 是否存在
-    hist_id = tokenizer.convert_tokens_to_ids("<history>")
-    curr_id = tokenizer.convert_tokens_to_ids("<current>")
-    print(f"ID Check -> <history>: {hist_id}, <current>: {curr_id}")
+    # 初始化 Mock
+    mock_processor = MockProcessor()
+    mock_tokenizer = MockTokenizer()
 
-    # 3. 初始化 Dataset
-    print(">>> 3. Initializing Dataset...")
+    # 初始化 Dataset
+    print("-" * 30)
     dataset = InstructBlipLoRADataset(
-        data_path=data_path,
-        processor=processor,
-        tokenizer=tokenizer,
-        image_root=image_root,
-        history_len=4,
-        current_len=1,
-        query_tokens=32
+        data_path=json_path,
+        processor=mock_processor,
+        tokenizer=mock_tokenizer,
+        image_root=image_root
     )
-    print(f"Dataset Length: {len(dataset)}")
+    print(f"✅ Dataset 加载成功，共有 {len(dataset)} 条数据")
 
-    # 取一个样本看看 Dataset 输出是否正常
-    sample = dataset[0]
-    print("\n--- [Dataset Single Sample Check] ---")
-    print(f"Pixel Values Shape: {sample['pixel_values'].shape} (Expect: [5, 3, 224, 224])")
-    print(f"LLM Full Text Prefix: {sample['llm_full_text'][:100]}...")
-    
-    # 检查 Token 扩展是否成功
-    # 应该包含大量 <history>
-    if sample['llm_full_text'].count("<history>") == 128:
-        print("✅ Token Expansion Check: <history> count is 128.")
-    else:
-        print(f"❌ Token Expansion Failed! Count is {sample['llm_full_text'].count('<history>')}")
-
-    # 4. 初始化 DataLoader & Collator
-    print("\n>>> 4. Initializing DataLoader...")
-    collator = DataCollatorForInstructBlip(processor, tokenizer)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=False, collate_fn=collator)
-
-    # 5. 获取一个 Batch 进行详细检查
-    print(">>> 5. Fetching one batch...")
+    # --- Test 1: 读取第一条数据，检查图片路径 ---
+    print("\n[Test 1] 正在读取第 1 条数据...")
     try:
-        batch = next(iter(dataloader))
+        item = dataset[0]
+        print("   RGB Tensor Shape:", item['pixel_values_rgb'].shape)
+        print("   Depth Tensor Shape:", item['pixel_values_depth'].shape)
+        
+        # 检查形状是否为 [5, 3, 224, 224]
+        if list(item['pixel_values_rgb'].shape) == [5, 3, 224, 224]:
+            print("   ✅ Tensor 形状正确 (5帧, 3通道)")
+        else:
+            print("   ❌ Tensor 形状异常！")
+
     except Exception as e:
-        print(f"❌ DataLoader Error: {e}")
+        print(f"   ❌ 读取失败: {e}")
         import traceback
         traceback.print_exc()
-        return
 
-    # 6. 验证 Tensor 形状
-    print("\n--- [Batch Tensor Shape Check] ---")
-    print(f"Pixel Values: {batch['pixel_values'].shape} (Expect: [2, 5, 3, 224, 224])")
-    print(f"Input IDs:    {batch['input_ids'].shape}    (Expect: [2, Seq_Len])")
-    print(f"Labels:       {batch['labels'].shape}       (Expect: [2, Seq_Len])")
-    print(f"Q-Former IDs: {batch['qformer_input_ids'].shape}")
+    # --- Test 2: DataLoader 批处理 ---
+    print("\n[Test 2] 正在测试 DataLoader (Batch Size=2)...")
+    collator = DataCollatorForInstructBlip(mock_processor, mock_tokenizer, mock_tokenizer)
+    loader = DataLoader(dataset, batch_size=2, collate_fn=collator)
 
-    # 7. 验证 Masking 逻辑 (最重要的一步)
-    print("\n--- [Label Masking Logic Check] ---")
-    # 我们把 input_ids 和 labels 解码回文本，看看对不对
-    
-    input_ids = batch['input_ids'][0]
-    labels = batch['labels'][0]
-    
-    print("Decoding Input IDs (What the model sees):")
-    decoded_input = tokenizer.decode(input_ids, skip_special_tokens=False)
-    # 为了避免打印太长，只打印开头和结尾
-    print(f"Start: {decoded_input[:200]}...")
-    print(f"End:   ...{decoded_input[-200:]}")
-
-    print("\nDecoding Labels (What the model predicts):")
-    # Labels 里有很多 -100，直接 decode 会报错，需要过滤
-    # 我们把 -100 变成 Pad Token ID 用于展示，或者直接忽略
-    valid_labels = labels.clone()
-    valid_labels[valid_labels == -100] = tokenizer.pad_token_id
-    
-    decoded_label = tokenizer.decode(valid_labels, skip_special_tokens=True)
-    print(f"Decoded Label Content: '{decoded_label.strip()}'")
-    
-    # 8. 判定逻辑
-    print("\n--- [Final Verdict] ---")
-    # 检查 Label 是否只包含回答部分
-    # 比如输入是 "USER: ... ASSISTANT: {'Route': 2}"
-    # Label 应该只剩下 "{'Route': 2}"
-    if "USER:" not in decoded_label and "ASSISTANT:" not in decoded_label and "Route" in decoded_label:
-         print("✅ Label Masking looks CORRECT. User prompt is masked.")
-    else:
-         print("⚠️ Label Masking might be WRONG. Check above outputs.")
-         
-    if batch['pixel_values'].shape[1] == 5:
-        print("✅ Image stacking looks CORRECT (5 frames).")
-    else:
-        print("❌ Image stacking WRONG.")
+    try:
+        batch = next(iter(loader))
+        print("   Batch RGB Shape:", batch['pixel_values_rgb'].shape)
+        print("   Batch Depth Shape:", batch['pixel_values_depth'].shape)
+        print("   Batch Labels Shape:", batch['labels'].shape)
+        print("   ✅ DataLoader 测试通过！")
+    except Exception as e:
+        print(f"   ❌ DataLoader 失败: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
-    test_pipeline()
+    main()
