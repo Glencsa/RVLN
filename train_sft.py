@@ -154,41 +154,124 @@ class WeightedTrainer(CustomTrainer):
 
 
 class ClassificationTrainer(CustomTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.acc_buffer = []
+        self.last_eval_visual_step = -1
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
-            Loss 计算逻辑，适配分类任务 (-1 到 8)，并记录训练准确率 (Train Acc)
+        Loss 计算 + 准确率累积模拟大 Batch
         """
-        # 1. 获取分类标签
+        # 1. 获取标签
         labels = inputs.get("class_labels")
         if labels is None:
             labels = inputs.get("labels") 
             
         # 2. 前向传播
         outputs = model(**inputs)
-        
-        # 3. 获取 Logits [Batch_Size, 10]
         logits = outputs.get("logits")
         
-        # 4. 计算 CrossEntropyLoss
+        # 3. 计算 Loss
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(logits, labels)
 
+        # 4. 计算准确率并累积
         if logits is not None:
             with torch.no_grad():
-                # 1. 获取预测类别 (argmax 找概率最大的下标)
                 preds = torch.argmax(logits, dim=-1)
                 
-                # 2. 计算准确率 (正确数 / 总数)
-                accuracy = (preds == labels).float().mean().item()
+                # --- A. 计算当前这 2 张图的准确率 ---
+                micro_acc = (preds == labels).float().mean().item()
                 
-                # 3. 手动记录到日志 (会显示在 SwanLab 的 train/accuracy 图表中)
-                # 为了防止日志刷屏，我们只在 Trainer 到了 logging_steps 时才记录
-                # (注意：self.state.global_step 是当前步数)
-                if self.state.global_step % self.args.logging_steps == 0:
-                    self.log({"train/accuracy": accuracy})
-
+                # --- B. 存入缓存 ---
+                # 只有在训练模式下才累积
+                if model.training:
+                    self.acc_buffer.append(micro_acc)
+                    
+                    # --- C. 检查是否存够了 (模拟大 Batch) ---
+                    # self.args.gradient_accumulation_steps 就是你设置的 8
+                    if len(self.acc_buffer) >= self.args.gradient_accumulation_steps:
+                        
+                        # 算平均值 (这就是大 Batch 的准确率)
+                        avg_acc = sum(self.acc_buffer) / len(self.acc_buffer)
+                        
+                        # 记录到日志
+                        self.log({"train/accuracy": avg_acc})
+                        
+                        # 清空缓存，准备下一轮累积
+                        self.acc_buffer = []
+        self._handle_visualization(model, inputs, preds, labels)
         return (loss, outputs) if return_outputs else loss
+    def _handle_visualization(self, model, inputs, preds, labels):
+        """
+        控制何时截图并上传到 SwanLab
+        """
+        current_step = self.state.global_step
 
+        # 情况 1: 正在训练 (Training)
+        # 每 50 步记录一次训练集的图
+        if model.training:
+            if self.is_world_process_zero() and current_step % 50 == 0:
+                self._log_visuals(inputs, preds, labels, prefix="Train")
+
+        # 情况 2: 正在验证 (Evaluation)
+        # model.training 为 False
+        else:
+            # 只有在主进程，且当前这一轮 Eval 还没记录过图片时，才记录
+            # (Trainer 在 Eval 过程中 global_step 是不会变的)
+            if self.is_world_process_zero() and self.last_eval_visual_step != current_step:
+                self._log_visuals(inputs, preds, labels, prefix="Eval")
+                # 标记这一轮已经记录过了
+                self.last_eval_visual_step = current_step
+
+    def _log_visuals(self, inputs, preds, labels, prefix="Train"):
+        """
+        执行具体的上传操作
+        prefix: 用于区分是 'Train' 还是 'Eval'
+        """
+        try:
+            idx = 0 # 取 Batch 第一张图
+            
+            # 1. 还原文本
+            instruction_text = self.processing_class.decode(
+                inputs["input_ids"][idx], 
+                skip_special_tokens=True
+            )
+            display_text = instruction_text[:100] + "..." if len(instruction_text) > 100 else instruction_text
+
+            # 2. 还原图片
+            # [Batch, 5, 3, H, W] -> 取最后一帧 -> [3, H, W]
+            rgb_tensor = inputs["pixel_values"][idx][-1] 
+            rgb_img = self._tensor_to_pil(rgb_tensor)
+
+            depth_tensor = inputs["depth_pixel_values"][idx][-1]
+            depth_img = self._tensor_to_pil(depth_tensor, is_depth=True)
+
+            # 3. 构建 Caption
+            pred_val = preds[idx].item() - 1  # 还原回 -1~8
+            gt_val = labels[idx].item() - 1
+            status = "✅" if pred_val == gt_val else "❌"
+            
+            caption = (f"[{prefix}] {status} Pred: {pred_val} | GT: {gt_val}\n"
+                       f"{display_text}")
+
+            # 4. 发送 SwanLab (使用 prefix 分组)
+            swanlab.log({
+                f"Visual/{prefix}_RGB": swanlab.Image(rgb_img, caption=caption),
+                f"Visual/{prefix}_Depth": swanlab.Image(depth_img, caption="Depth Map")
+            })
+            
+        except Exception as e:
+            print(f"SwanLab Visual Error: {e}")
+
+    def _tensor_to_pil(self, tensor, is_depth=False):
+        """反归一化并转 PIL"""
+        img = tensor.cpu().numpy().transpose(1, 2, 0)
+        img = img - img.min()
+        img = img / (img.max() + 1e-6)
+        img = (img * 255).astype(np.uint8)
+        return img
 
 
 def compute_metrics(eval_pred):
@@ -218,7 +301,7 @@ def main():
     
     # 训练参数
     batch_size = 2
-    grad_accumulation = 4 # 稍微加大累积，模拟更大 batch
+    grad_accumulation = 8 # 稍微加大累积，模拟更大 batch
     learning_rate = 5e-5  # SFT LLM 学习率
     num_epochs = 3
     lora_rank = 32
@@ -250,7 +333,9 @@ def main():
     processor = InstructBlipProcessor.from_pretrained(model_name_or_path)
     tokenizer = processor.tokenizer
     qformer_tokenizer = processor.qformer_tokenizer
-
+    tokenizer.padding_side = "right"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     # 添加特殊 Token
     special_tokens_dict = {'additional_special_tokens': ["<history>", "<current>"]}
     tokenizer.add_special_tokens(special_tokens_dict)
@@ -362,7 +447,7 @@ def main():
         load_best_model_at_end=True,   # 训练结束时，自动加载验证集效果最好的模型
         metric_for_best_model="loss",  # 以 loss 为标准 (loss 越小越好)
         greater_is_better=False,       # loss 是越小越好，所以是 False
-        logging_steps=5,
+        logging_steps=4,
     )
 
     # 使用自定义 Trainer
