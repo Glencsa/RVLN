@@ -493,7 +493,8 @@ def main():
         data_collator=collator,
         processing_class=tokenizer,
         compute_metrics=compute_metrics,
-        callbacks=[SwanLabCallback()]
+        callbacks=[SwanLabCallback()],
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics
     )
 
     trainer.train()
