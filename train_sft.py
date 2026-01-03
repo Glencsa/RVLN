@@ -42,73 +42,107 @@ class CustomTrainer(Trainer):
             
             print(f"Model (LoRA + Embeddings) saved to {output_dir}")
 
-class WeightedTrainer(CustomTrainer):
+class WeightedTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # 获取数字 -1, 0-8 的 Token ID
-        # 注意：不同 Tokenizer 对数字的处理不同，有可能是 "8" 也有可能是 " 8" (带空格)
-        # 这里把常见可能都加进去，确保万无一失
-        self.target_tokens = set()
-        for i in range(-1, 9): # -1 到 8
-            # 纯数字
-            self.target_tokens.add(self.tokenizer.convert_tokens_to_ids(str(i)))
-            # 带空格的数字 (SentencePiece 常见)
-            self.target_tokens.add(self.tokenizer.convert_tokens_to_ids(" " + str(i)))
         
-        # 处理 "-1" 这种情况，Tokenzier 可能会把它拆成 "-" 和 "1"
-        # 如果你想把 "-" 也加权，可以加上
-        self.target_tokens.add(self.tokenizer.convert_tokens_to_ids("-"))
+        # --- 初始化目标 Token 集合 ---
+        self.target_token_ids = set()
+        
+        # 定义你需要加权的数字（字符形式）
+        # 包括 -1 和 0-8
+        target_strings = [str(i) for i in range(9)] + ["-1", "-"] 
+        
+        # 遍历词表，找到所有可能的编码形式（例如 "8", " 8", "##8" 等）
+        # 注意：这种方式比 convert_tokens_to_ids 更稳健，能处理 SentencePiece 的下划线前缀等情况
+        vocab = self.tokenizer.get_vocab()
+        
+        for token_str, token_id in vocab.items():
+            # 这里需要根据你的 Tokenizer 实际情况调整
+            # 很多 Tokenizer (如 Llama/T5) 会在词前加 " " 或 " "
+            # 我们简单粗暴地检查 token 文本是否包含数字
+            
+            # 简化逻辑：直接添加明确的 ID
+            pass 
 
-        # 权重倍数：关键 Token 的 Loss 放大 10 倍
+        # 推荐：直接精准添加 ID (以 Llama/Qwen 等常用 Tokenizer 为例)
+        # 1. 纯数字
+        for i in range(9):
+            # 尝试添加 "1", " 1" 等形式
+            self.target_token_ids.add(self.tokenizer.convert_tokens_to_ids(str(i)))
+            # 有些 tokenizer 会把空格后的数字单独作为一个 token
+            self.target_token_ids.add(self.tokenizer.convert_tokens_to_ids(" " + str(i)))
+        
+        # 2. 处理负号 (对于 -1)
+        # 通常 "-1" 会被拆分为 ["-", "1"]。我们只能给 "-" 加权，或者给 "1" 加权。
+        # 给 "-" 加权可能会影响所有负数，但如果是导航场景通常是可以接受的。
+        self.target_token_ids.add(self.tokenizer.convert_tokens_to_ids("-"))
+        self.target_token_ids.add(self.tokenizer.convert_tokens_to_ids(" -"))
+
+        # 移除可能存在的 Unknown token ID
+        if self.tokenizer.unk_token_id in self.target_token_ids:
+            self.target_token_ids.remove(self.tokenizer.unk_token_id)
+            
+        print(f"WeightedTrainer: 已激活加权 Token IDs: {self.target_token_ids}")
+
+        # 权重倍数
         self.key_token_weight = 10.0
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
-        重写 Loss 计算逻辑，对数字 Token 进行加权
+        自定义 Loss 计算，对特定 Token 进行加权
         """
-        # 1. 正常的前向传播
+        # 1. 获取 Labels 并确保 device 正确
         labels = inputs.get("labels")
+        
+        # 2. 前向传播
+        # model(**inputs) 调用的是我们修改后的 forward，它不计算 loss
         outputs = model(**inputs)
-        
-        # 2. 获取 Logits
         logits = outputs.get("logits")
-        
-        # 3. 移位 (Shift) 以适配 Causal LM
-        # 预测第 i 个 token 用的是第 i-1 个 token 的输出
+
+        # 3. 移位 (Shift) 操作 - 核心步骤
+        # Causal LM 中，logits[i] 预测的是 labels[i+1]
+        # 所以我们需要去掉 logits 的最后一个，去掉 labels 的第一个
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-        
-        # 4. 展平
+
+        # 4. 展平 (Flatten) 以便计算 CrossEntropy
+        # view(-1, vocab_size) 将 (batch, seq, vocab) -> (batch*seq, vocab)
         batch_size, seq_len, vocab_size = shift_logits.shape
         flat_logits = shift_logits.view(-1, vocab_size)
         flat_labels = shift_labels.view(-1)
-        
-        # 5. 计算未缩减的 CrossEntropy Loss (reduction='none')
-        # 这样我们会得到每一个 Token 的 Loss，而不是一个平均值
-        loss_fct = nn.CrossEntropyLoss(reduction='none')
-        # 只需要计算 label != -100 的部分
+
+        # 5. 计算未缩减 (Reduction='none') 的 Loss
+        # 这样我们会得到形状为 (batch*seq, ) 的 loss 向量
+        loss_fct = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
         token_losses = loss_fct(flat_logits, flat_labels)
-        
-        # 6. 创建权重 Mask
+
+        # 6. 构建权重矩阵
         # 默认权重为 1.0
         weights = torch.ones_like(token_losses)
         
-        # 找到 Label 是数字的地方，将权重设为 10.0
-        # 这是一个 Tensor 操作，速度很快
-        for target_id in self.target_tokens:
+        # 7. 识别目标 Token 并加权
+        # flat_labels 中包含真实的 token id
+        # 我们创建一个 mask，标记出所有属于 target_token_ids 的位置
+        
+        # 方法 A: 循环判断 (简单易懂，但在 GPU 上做循环效率略低，不过 token 种类少时没问题)
+        for target_id in self.target_token_ids:
+            # 找到 label 等于 目标数字 的位置
             weights[flat_labels == target_id] = self.key_token_weight
             
-        # 7. 应用权重
+        # 8. 应用权重
         weighted_loss = token_losses * weights
+
+        # 9. 计算最终平均 Loss
+        # 注意：分母应该是有效 Token 的数量 (即 label != -100 的数量)，而不是所有 Token
+        # CrossEntropyLoss 已经处理了 ignore_index 对应的 loss 为 0，但我们需要正确处理分母
         
-        # 8. 取平均 (只对非 Mask 的部分取平均)
-        # 统计有效 Token 数量 (labels != -100)
         active_elements = (flat_labels != -100).sum()
         
         if active_elements > 0:
             final_loss = weighted_loss.sum() / active_elements
         else:
-            final_loss = weighted_loss.sum()
+            final_loss = weighted_loss.sum() # 防止除以 0
 
         return (final_loss, outputs) if return_outputs else final_loss
 
@@ -324,7 +358,7 @@ def main():
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
             "lora_dropout": 0.05,
-            "modules_to_save": ["embed_tokens", "lm_head","score_head"]
+            "modules_to_save": ["embed_tokens", "lm_head"]# "score_head"
         }
     )
     
@@ -387,7 +421,7 @@ def main():
         lora_dropout=0.05,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
-        modules_to_save=["embed_tokens", "lm_head","score_head"] 
+        modules_to_save=["embed_tokens", "lm_head"]# "score_head" 
     )
     
     print("Applying LoRA to LLM...")
@@ -449,7 +483,7 @@ def main():
     )
 
     # 使用自定义 Trainer
-    trainer = ClassificationTrainer(
+    trainer = WeightedTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,

@@ -108,15 +108,15 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
             nn.Linear(512, 2) 
         )
         llm_hidden_size = self.language_model.config.hidden_size
-        self.score_head = nn.Sequential(
-            nn.Linear(llm_hidden_size, llm_hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(llm_hidden_size, 10) # 输出 10 个 logits
-        )
+        # self.score_head = nn.Sequential(
+        #     nn.Linear(llm_hidden_size, llm_hidden_size),
+        #     nn.ReLU(),
+        #     nn.Dropout(0.1),
+        #     nn.Linear(llm_hidden_size, 10) # 输出 10 个 logits
+        # )
         
-        # 初始化分类头
-        self._init_weights(self.score_head)
+        # # 初始化分类头
+        # self._init_weights(self.score_head)
         self._init_weights(self.itm_head)
 
     def _init_weights(self, module):
@@ -261,7 +261,7 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
             qformer_attention_mask: torch.LongTensor,
             input_ids: torch.LongTensor,
             attention_mask: torch.LongTensor = None,
-            class_labels: torch.LongTensor = None,
+            labels: torch.LongTensor = None,
             **kwargs
         ):
             # 1. 传入 depth_pixel_values
@@ -289,26 +289,26 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
                 output_hidden_states=True,
                 return_dict=True
             )
-            
-            
-            # 严谨做法：根据 attention_mask 找最后一个非 pad 的 token
-            last_hidden_state = outputs.hidden_states[-1]
-            batch_size = last_hidden_state.shape[0]
-            sequence_lengths = (torch.eq(attention_mask, 1)).sum(1) - 1
-            pooled_output = last_hidden_state[torch.arange(batch_size, device=last_hidden_state.device), sequence_lengths]
+            return outputs
+            # 训练分类头
+            # # 严谨做法：根据 attention_mask 找最后一个非 pad 的 token
+            # last_hidden_state = outputs.hidden_states[-1]
+            # batch_size = last_hidden_state.shape[0]
+            # sequence_lengths = (torch.eq(attention_mask, 1)).sum(1) - 1
+            # pooled_output = last_hidden_state[torch.arange(batch_size, device=last_hidden_state.device), sequence_lengths]
 
-            # 5. 分类 logits
-            logits = self.score_head(pooled_output) # [B, 10]
+            # # 5. 分类 logits
+            # logits = self.score_head(pooled_output) # [B, 10]
 
-            loss = None
-            if class_labels is not None:
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(logits, class_labels)
+            # loss = None
+            # if class_labels is not None:
+            #     loss_fct = nn.CrossEntropyLoss()
+            #     loss = loss_fct(logits, class_labels)
 
-            return {
-                "loss": loss,
-                "logits": logits
-            }
+            # return {
+            #     "loss": loss,
+            #     "logits": logits
+            # }
 
     @torch.no_grad()
     def generate(
