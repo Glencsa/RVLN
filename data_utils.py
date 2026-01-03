@@ -126,8 +126,8 @@ class DataCollatorForRvln:
 
     def __call__(self, batch):
         # 1. 堆叠图像 [Batch, 5, 3, 224, 224]
-        pixel_values_rgb = torch.stack([item["pixel_values_rgb"] for item in batch])
-        pixel_values_depth = torch.stack([item["pixel_values_depth"] for item in batch])
+        pixel_values_rgb = torch.stack([item["pixel_values"] for item in batch])
+        pixel_values_depth = torch.stack([item["depth_pixel_values"] for item in batch])
         
         # 2. 堆叠 Q-Former Input (Dataset 里已经做了 Padding，直接 Stack)
         qformer_input_ids = torch.stack([item["qformer_input_ids"] for item in batch])
