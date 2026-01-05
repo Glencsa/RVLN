@@ -23,131 +23,189 @@ from models.rvln import RvlnMultiTask
 from data_utils import RvlnLoRADataset, DataCollatorForRvln
 from utils import *
 
-# ==========================================
-# 3. 自定义 Trainer (确保保存 Embeddings)
-# ==========================================
-class CustomTrainer(Trainer):
-    def save_model(self, output_dir=None, _internal_call=False):
-        """重写保存逻辑，确保 LoRA + Embeddings + Tokenizer 都能被保存"""
-        if output_dir is None:
-            output_dir = self.args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # 1. 保存 LoRA 和 modules_to_save (embed_tokens)
-        super().save_model(output_dir, _internal_call)
-        
-        # 2. 保存 Tokenizer
-        if self.is_world_process_zero():
-            self.tokenizer.save_pretrained(output_dir)
-            
-            print(f"Model (LoRA + Embeddings) saved to {output_dir}")
-
-class WeightedTrainer(CustomTrainer):
+class WeightedTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-        # --- 初始化目标 Token 集合 ---
-        self.target_token_ids = set()
+        # ==================== 1. 初始化 Token 映射与超参数 ====================
+        self.target_token_ids = set() # 用于基础加权 Mask (包含 -1)
+        self.id_to_value = {}         # 用于距离计算 (只包含 0-8)
+        self.digit_canonical_ids = [] # 存储 0-8 的标准 Token ID，用于提取 Soft Logits
         
-        # 定义你需要加权的数字（字符形式）
-        # 包括 -1 和 0-8
-        target_strings = [str(i) for i in range(9)] + ["-1", "-"] 
-        
-        # 遍历词表，找到所有可能的编码形式（例如 "8", " 8", "##8" 等）
-        # 注意：这种方式比 convert_tokens_to_ids 更稳健，能处理 SentencePiece 的下划线前缀等情况
-        vocab = self.tokenizer.get_vocab()
-        
-        for token_str, token_id in vocab.items():
-            # 这里需要根据你的 Tokenizer 实际情况调整
-            # 很多 Tokenizer (如 Llama/T5) 会在词前加 " " 或 " "
-            # 我们简单粗暴地检查 token 文本是否包含数字
-            
-            # 简化逻辑：直接添加明确的 ID
-            pass 
+        # --- 超参数设置 ---
+        self.key_token_weight = 10.0  # 硬标签权重 (做对了奖励大)
+        self.soft_loss_weight = 2.0   # 软标签权重 (控制距离惩罚的力度)
+        self.sigma = 1.0              # 高斯分布标准差 (越大越宽容)
 
-        # 推荐：直接精准添加 ID (以 Llama/Qwen 等常用 Tokenizer 为例)
-        # 1. 纯数字
+        # --- A. 注册数字 0-8 (参与高斯计算) ---
         for i in range(9):
-            # 尝试添加 "1", " 1" 等形式
-            self.target_token_ids.add(self.tokenizer.convert_tokens_to_ids(str(i)))
-            # 有些 tokenizer 会把空格后的数字单独作为一个 token
-            self.target_token_ids.add(self.tokenizer.convert_tokens_to_ids(" " + str(i)))
-        
-        # 2. 处理负号 (对于 -1)
-        # 通常 "-1" 会被拆分为 ["-", "1"]。我们只能给 "-" 加权，或者给 "1" 加权。
-        # 给 "-" 加权可能会影响所有负数，但如果是导航场景通常是可以接受的。
-        self.target_token_ids.add(self.tokenizer.convert_tokens_to_ids("-"))
-        self.target_token_ids.add(self.tokenizer.convert_tokens_to_ids(" -"))
-
-        # 移除可能存在的 Unknown token ID
-        if self.tokenizer.unk_token_id in self.target_token_ids:
-            self.target_token_ids.remove(self.tokenizer.unk_token_id)
+            s = str(i)
+            # 获取该数字的所有可能 Token ID (例如 "1", " 1")
+            ids = [
+                self.tokenizer.convert_tokens_to_ids(s),
+                self.tokenizer.convert_tokens_to_ids(" " + s)
+            ]
             
-        print(f"WeightedTrainer: 已激活加权 Token IDs: {self.target_token_ids}")
+            # 记录第一个有效的 ID 作为该数字的"代表"，用于提取 Logits 计算 Soft Loss
+            # (通常 tokenizer 的第一个结果就是最常用的)
+            canonical_added = False
+            
+            for tid in ids:
+                if tid != self.tokenizer.unk_token_id:
+                    self.target_token_ids.add(tid)
+                    self.id_to_value[tid] = i  # 建立 ID -> 整数值 的映射
+                    
+                    if not canonical_added:
+                        self.digit_canonical_ids.append(tid)
+                        canonical_added = True
+        
+        # 确保我们收集齐了 0-8 的代表 ID，否则无法进行 Softmax 计算
+        if len(self.digit_canonical_ids) != 9:
+            print("⚠️ Warning: 无法找到 0-8 的完整 Token ID，软标签逻辑可能受损。")
 
-        # 权重倍数
-        self.key_token_weight = 10.0
+        # --- B. 注册负号/-1 (只加权，不参与高斯) ---
+        # -1 代表 Stop，它在空间上没有"邻居"，所以只做硬分类
+        neg_ids = [
+            self.tokenizer.convert_tokens_to_ids("-"),
+            self.tokenizer.convert_tokens_to_ids(" -"),
+            self.tokenizer.convert_tokens_to_ids("-1"),
+            self.tokenizer.convert_tokens_to_ids(" -1")
+        ]
+        for tid in neg_ids:
+            if tid != self.tokenizer.unk_token_id:
+                self.target_token_ids.add(tid)
+                # 注意：不在 id_to_value 中注册
+
+        # 打印日志（只在主进程）
+        if self.is_world_process_zero():
+            print(f"WeightedTrainer Ready:")
+            print(f"  - Hard Weighted Tokens: {len(self.target_token_ids)}")
+            print(f"  - Distance Aware Tokens: 0-8 (Sigma={self.sigma})")
+
+    def generate_gaussian_target(self, gt_values, num_classes=9):
+        """
+        生成高斯分布目标
+        gt_values: [Batch] 真实的数字值 (0-8)
+        """
+        device = gt_values.device
+        # 创建 [Batch, 9] 的矩阵，每一行都是 0,1,2...8
+        target_indices = torch.arange(num_classes, device=device).expand(len(gt_values), -1)
+        # 扩展 GT: [Batch, 1] -> [Batch, 9]
+        gt_expand = gt_values.unsqueeze(1).expand(-1, num_classes)
+        
+        # 计算距离平方
+        distance = (target_indices - gt_expand).float() ** 2
+        
+        # 高斯公式: exp(-dist / 2*sigma^2)
+        scores = torch.exp(-distance / (2 * self.sigma ** 2))
+        
+        # 归一化 (Sum = 1)，这就变成了一个概率分布
+        probs = scores / scores.sum(dim=1, keepdim=True)
+        return probs
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
-        自定义 Loss 计算，对特定 Token 进行加权
+        Loss = Hard_Weighted_CE + Alpha * Soft_Gaussian_KL
         """
-        # 1. 获取 Labels 并确保 device 正确
+        # 1. 获取 Labels
         labels = inputs.get("labels")
         
         # 2. 前向传播
-        # model(**inputs) 调用的是我们修改后的 forward，它不计算 loss
         outputs = model(**inputs)
         logits = outputs.get("logits")
 
-        # 3. 移位 (Shift) 操作 - 核心步骤
-        # Causal LM 中，logits[i] 预测的是 labels[i+1]
-        # 所以我们需要去掉 logits 的最后一个，去掉 labels 的第一个
+        # 3. Shift 操作 (对齐 Logits 和 Labels)
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
-        # 4. 展平 (Flatten) 以便计算 CrossEntropy
-        # view(-1, vocab_size) 将 (batch, seq, vocab) -> (batch*seq, vocab)
+        # 4. 展平
         batch_size, seq_len, vocab_size = shift_logits.shape
         flat_logits = shift_logits.view(-1, vocab_size)
         flat_labels = shift_labels.view(-1)
 
-        # 5. 计算未缩减 (Reduction='none') 的 Loss
-        # 这样我们会得到形状为 (batch*seq, ) 的 loss 向量
+        # ==================== Part 1: 基础加权 Loss (Hard Target) ====================
+        # 计算所有 Token 的 CrossEntropy
         loss_fct = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
         token_losses = loss_fct(flat_logits, flat_labels)
 
-        # 6. 构建权重矩阵
-        # 默认权重为 1.0
+        # 构建权重矩阵
         weights = torch.ones_like(token_losses)
         
-        # 7. 识别目标 Token 并加权
-        # flat_labels 中包含真实的 token id
-        # 我们创建一个 mask，标记出所有属于 target_token_ids 的位置
-        
-        # 方法 A: 循环判断 (简单易懂，但在 GPU 上做循环效率略低，不过 token 种类少时没问题)
-        for target_id in self.target_token_ids:
-            # 找到 label 等于 目标数字 的位置
-            weights[flat_labels == target_id] = self.key_token_weight
-            
-        # 8. 应用权重
-        weighted_loss = token_losses * weights
+        # 标记哪些位置是需要计算距离的数字 (0-8)
+        ordinal_mask = torch.zeros_like(token_losses, dtype=torch.bool)
+        # 存储这些位置对应的真实整数值
+        ordinal_gt_values = torch.zeros_like(flat_labels, dtype=torch.long)
 
-        # 9. 计算最终平均 Loss
-        # 注意：分母应该是有效 Token 的数量 (即 label != -100 的数量)，而不是所有 Token
-        # CrossEntropyLoss 已经处理了 ignore_index 对应的 loss 为 0，但我们需要正确处理分母
+        # 应用权重并识别数字
+        # (这里为了代码清晰使用了循环，Token 只有十几个，开销可忽略)
+        for target_id in self.target_token_ids:
+            is_target = (flat_labels == target_id)
+            # 加权
+            weights[is_target] = self.key_token_weight
+            
+            # 如果是 0-8，加入 Soft Loss 计算队列
+            if target_id in self.id_to_value:
+                ordinal_mask |= is_target
+                # 记录该 Token ID 对应的整数值 (例如 ID 299 -> Value 8)
+                ordinal_gt_values[is_target] = self.id_to_value[target_id]
+
+        weighted_loss = token_losses * weights
         
+        # 计算平均 Hard Loss
         active_elements = (flat_labels != -100).sum()
+        base_loss = weighted_loss.sum() / (active_elements + 1e-6)
+
+        # ==================== Part 2: 距离感知 Loss (Soft Target) ====================
+        soft_loss = torch.tensor(0.0, device=flat_logits.device)
         
-        if active_elements > 0:
-            final_loss = weighted_loss.sum() / active_elements
-        else:
-            final_loss = weighted_loss.sum() # 防止除以 0
+        if ordinal_mask.any():
+            # 1. 取出属于数字的样本的 Logits
+            # 我们只关心模型在 0-8 这 9 个 Token 上的表现
+            # digit_canonical_ids 是我们预先存好的 [id_0, id_1, ..., id_8]
+            digit_ids_tensor = torch.tensor(self.digit_canonical_ids, device=flat_logits.device)
+            
+            # 提取 Mask 对应的 Logits 行，且只提取 9 个数字列 -> [N_ordinal, 9]
+            subset_logits = flat_logits[ordinal_mask][:, digit_ids_tensor]
+            
+            # 2. 计算 Log Softmax (模型预测分布)
+            subset_log_probs = F.log_softmax(subset_logits, dim=-1)
+            
+            # 3. 生成高斯目标分布 (Target分布) -> [N_ordinal, 9]
+            subset_gt = ordinal_gt_values[ordinal_mask]
+            soft_targets = self.generate_gaussian_target(subset_gt, num_classes=9)
+            
+            # 4. 计算 KL 散度 (KLDiv = -Sum(P_target * log P_pred))
+            # 衡量模型分布与高斯分布的差异
+            kl_loss = F.kl_div(subset_log_probs, soft_targets, reduction='batchmean')
+            
+            soft_loss = kl_loss
+
+        # ==================== Part 3: 总 Loss ====================
+        final_loss = base_loss + self.soft_loss_weight * soft_loss
 
         return (final_loss, outputs) if return_outputs else final_loss
 
+    def save_model(self, output_dir=None, _internal_call=False):
+        """
+        重写保存逻辑：
+        保存 LoRA + Embeddings + Tokenizer
+        """
+        if output_dir is None:
+            output_dir = self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 1. 保存模型权重
+        super().save_model(output_dir, _internal_call)
+        
+        # 2. 保存 Tokenizer (只在主进程)
+        if self.is_world_process_zero():
+            # 兼容处理: 新版 Transformers 建议用 processing_class
+            saver = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
+            if saver:
+                saver.save_pretrained(output_dir)
+                print(f"Model components (Weights + Tokenizer) saved to {output_dir}")
 
-class ClassificationTrainer(CustomTrainer):
+class ClassificationTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.acc_buffer = []
@@ -323,6 +381,26 @@ class ClassificationTrainer(CustomTrainer):
         img = img / (img.max() + 1e-6)
         img = (img * 255).astype(np.uint8)
         return img
+    def save_model(self, output_dir=None, _internal_call=False):
+        """
+        除了保存 LoRA 权重外，强制保存 Tokenizer 和 Embeddings (如果在 modules_to_save 中)
+        """
+        if output_dir is None:
+            output_dir = self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 1. 调用父类方法保存模型权重 (LoRA + modules_to_save)
+        super().save_model(output_dir, _internal_call)
+        
+        # 2. 额外保存 Tokenizer (只在主进程执行)
+        if self.is_world_process_zero():
+            # 兼容新版 transformers 使用 processing_class，旧版使用 tokenizer
+            if hasattr(self, "processing_class") and self.processing_class is not None:
+                self.processing_class.save_pretrained(output_dir)
+            elif hasattr(self, "tokenizer") and self.tokenizer is not None:
+                self.tokenizer.save_pretrained(output_dir)
+            
+            print(f"Model (LoRA + Embeddings + Tokenizer) saved to {output_dir}")
 
 
 
