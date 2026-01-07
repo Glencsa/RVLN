@@ -33,10 +33,9 @@ class WeightedTrainer(Trainer):
         self.digit_canonical_ids = [] # 存储 0-8 的标准 Token ID，用于提取 Soft Logits
         
         # --- 超参数设置 ---
-        self.key_token_weight = 10.0  # 硬标签权重 (做对了奖励大)
-        self.soft_loss_weight = 2.0   # 软标签权重 (控制距离惩罚的力度)
-        self.sigma = 1.0              # 高斯分布标准差 (越大越宽容)
-
+        self.key_token_weight = 1.0  # 硬标签权重 (做对了奖励大)
+        self.soft_loss_weight = 5.0   # 软标签权重 (控制距离惩罚的力度)
+        self.sigma = 2.0              # 高斯分布标准差 (越大越宽容)
         # --- A. 注册数字 0-8 (参与高斯计算) ---
         for i in range(9):
             s = str(i)
@@ -215,7 +214,7 @@ def main():
     batch_size = 4 
     grad_accumulation = 8 # 稍微加大累积，模拟更大 batch
     learning_rate = 2e-4  # SFT LLM 学习率
-    num_epochs = 3
+    num_epochs = 10 
     lora_rank = 32
     lora_alpha = 64
     
@@ -317,7 +316,7 @@ def main():
         current_len=1
     )
     
-    val_ratio = 0.01  # 1% 做验证，99% 训练
+    val_ratio = 0.1  # 10% 做验证，90% 训练
     val_size = int(len(full_dataset) * val_ratio)
     train_size = len(full_dataset) - val_size
     
