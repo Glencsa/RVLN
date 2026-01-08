@@ -3,7 +3,7 @@ import json
 import torch
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
-from data_utils import InstructBlipLoRADataset, DataCollatorForInstructBlip
+from utils.data_utils import InstructBlipLoRADataset, DataCollatorForInstructBlip
 # ==========================================
 # 1. Mock 组件 (用于模拟 Processor 和 Tokenizer)
 # ==========================================

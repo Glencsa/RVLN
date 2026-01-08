@@ -20,8 +20,8 @@ from peft import (
 )
 from swanlab.integration.huggingface import SwanLabCallback
 from models.rvln import RvlnMultiTask 
-from data_utils import RvlnLoRADataset, DataCollatorForRvln
-from utils import *
+from utils.data_utils import RvlnLoRADataset, DataCollatorForRvln
+from utils.utils import *
 
 class WeightedTrainer(Trainer):
     def __init__(self, *args, **kwargs):
@@ -546,7 +546,7 @@ def main():
         learning_rate=learning_rate,
         num_train_epochs=num_epochs,
         fp16=True,
-        deepspeed="./ds_config_zero2.json",
+        deepspeed="./config/ds_config_zero2.json",
         remove_unused_columns=False,
         report_to="none",
         evaluation_strategy="steps",   # 按步数评估 (也可以选 "epoch")

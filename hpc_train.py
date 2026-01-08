@@ -20,8 +20,8 @@ from peft import (
     TaskType
 )
 from models.rvln import RvlnMultiTask 
-from data_utils import RvlnLoRADataset, DataCollatorForRvln
-from utils import *
+from utils.data_utils import RvlnLoRADataset, DataCollatorForRvln
+from utils.utils import *
 
 class WeightedTrainer(Trainer):
     def __init__(self, *args, **kwargs):
@@ -362,7 +362,7 @@ def main():
         num_train_epochs=num_epochs,
         fp16=False,
         bf16=True,
-        deepspeed="./ds_config_zero2_1.json",
+        deepspeed="./config/ds_config_zero2_1.json",
         remove_unused_columns=False,
         report_to="none", 
         evaluation_strategy="steps",   
