@@ -98,10 +98,9 @@ class RvlnLoRADataset(Dataset):
         }
 
 class DataCollatorForRvln:
-    def __init__(self, processor, tokenizer, qformer_tokenizer):
+    def __init__(self, processor, tokenizer):
         self.processor = processor
         self.tokenizer = tokenizer
-        self.qformer_tokenizer = qformer_tokenizer
         
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 

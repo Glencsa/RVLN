@@ -5,8 +5,6 @@ import torch.distributed as dist
 import numpy as np 
 import torch.nn.functional as F
 from torch.utils.data import random_split
-import swanlab
-from swanlab.integration.huggingface import SwanLabCallback
 from transformers import (
     InstructBlipProcessor,
     InstructBlipConfig,
@@ -235,31 +233,11 @@ def main():
     lora_rank = 32
     lora_alpha = 64
     
-    swanlab.login(api_key="jpnq84pFWGxNf9thDyX9P")
-    swanlab.init(
-        project="Rvln-LoRA-SFT",
-        experiment_name="vicuna-7b-lora-stage2",
-        description="Rvln Stage 2 SFT with LoRA monitoring",
-        config={
-            "model_name": model_name_or_path,
-            "stage1_checkpoint": stage1_checkpoint,
-            "data_path": data_path,
-            "batch_size": batch_size,
-            "grad_accumulation": grad_accumulation,
-            "learning_rate": learning_rate,
-            "num_epochs": num_epochs,
-            "lora_rank": lora_rank,
-            "lora_alpha": lora_alpha,
-            "lora_dropout": 0.05,
-            "modules_to_save": ["embed_tokens", "lm_head"]# "score_head"
-        }
-    )
     
     # =================1. Processor & Tokenizer=================
     print("Loading Processor...")
     processor = InstructBlipProcessor.from_pretrained(model_name_or_path)
     tokenizer = processor.tokenizer
-    qformer_tokenizer = processor.qformer_tokenizer
     tokenizer.padding_side = "right"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -348,8 +326,7 @@ def main():
 
     collator = DataCollatorForRvln(
         processor=processor,
-        tokenizer=tokenizer,
-        qformer_tokenizer=qformer_tokenizer
+        tokenizer=tokenizer
     )
 
     # ================= 6. Trainer Setup =================
@@ -391,7 +368,7 @@ def main():
         data_collator=collator,
         processing_class=tokenizer,
         compute_metrics=compute_metrics,
-        callbacks=[SwanLabCallback()],
+        callbacks=[],
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
     )
 
