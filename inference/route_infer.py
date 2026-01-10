@@ -1,0 +1,97 @@
+import os
+import torch
+import numpy as np
+from PIL import Image
+from transformers import InstructBlipProcessor
+from utils.utils import prepare_inputs_for_generate
+try:
+    from models.rvln import RvlnMultiTask
+except ImportError:
+    raise ImportError("请确保 models/rvln.py 存在，并且其中定义了 RvlnMultiTask 类。")
+
+
+CHECKPOINT_PATH = "output/rvln_merged_final"  
+stage1_checkpoint = "output/stage1_checkpoint/latest_checkpoint.pth"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.float16  # 3090/4090/A100 必选 bf16
+
+def load_model():
+    print(f"Loading model from: {CHECKPOINT_PATH}")
+    processor = InstructBlipProcessor.from_pretrained(CHECKPOINT_PATH)
+    tokenizer = processor.tokenizer
+    tokenizer.padding_side = "right"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    hist_id = tokenizer.convert_tokens_to_ids("<history>")
+    curr_id = tokenizer.convert_tokens_to_ids("<current>")
+    vocab_size = len(tokenizer)
+    print(f"   -> Tokenizer IDs: <history>={hist_id}, <current>={curr_id}, Vocab={vocab_size}")
+    # Load Model
+    model = RvlnMultiTask.from_pretrained(
+        CHECKPOINT_PATH,
+        torch_dtype=DTYPE,
+    ).to(DEVICE)
+    model.eval()
+    model_emb_size = model.language_model.get_input_embeddings().weight.shape[0]
+    # print(f"   -> Model Embedding Size: {model_emb_size}")
+    # model.language_model.resize_token_embeddings(len(tokenizer))
+    print("Model loaded successfully!")
+    return model, processor
+
+
+def run_inference(model, processor, rgb_input, depth_input, instruction):
+    """
+    rgb_input: 可以是单张图片路径(str)，也可以是路径列表(list[str])
+    depth_input: 同上
+    """
+    # 统一转为 list 格式方便处理
+    if not isinstance(rgb_input, list):
+        rgb_input = [rgb_input]
+    if not isinstance(depth_input, list):
+        depth_input = [depth_input]
+        
+    print(f"\n📸 Processing sequence (len={len(rgb_input)})...")
+    
+    # 1. 预处理 (自动补齐)
+    inputs = prepare_inputs_for_generate(rgb_input, depth_input, instruction, processor, model.device)
+    
+    # 2. 生成
+    print("🚀 Generating...")
+    with torch.no_grad():
+        outputs = model.generate(
+            pixel_values=inputs["pixel_values"],
+            depth_pixel_values=inputs["depth_pixel_values"],
+            qformer_input_ids=inputs["qformer_input_ids"],
+            qformer_attention_mask=inputs["qformer_attention_mask"],
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=100,
+            do_sample=False,
+            repetition_penalty=1.0 
+        )
+
+    # 3. 解码
+    output_text = processor.batch_decode(outputs, skip_special_tokens=True)[0]
+    
+    print("-" * 40)
+    print(f"📝 Prediction: {output_text.strip()}")
+    print("-" * 40)
+
+if __name__ == "__main__":
+    # 初始化
+    model, processor = load_model()
+    
+    instruction = 'Go around the right side of the center unit and stop by the right side doorway with the dining table and mirror in it.'
+    
+    # 场景 1: 只有当前一张图 (刚启动)
+    # 系统会自动补齐为: [黑, 黑, 黑, 黑, Img1]
+    rgb_1 = ["test_data/rgb/step_0_depth_with_points.jpg"]
+    depth_1 = ["test_data/depth/step_0_depth.png"]
+    run_inference(model, processor, rgb_1, depth_1, instruction)
+
+    # 场景 2: 已经走了几步 (历史队列)
+    # 系统会自动取最后5张: [Img1, Img2, Img3, Img4, Img5] (假设 Img5 是当前)
+    # 这里用同一个图模拟多帧
+    rgb_history = [rgb_1[0]] * 6  # 模拟有6张图
+    depth_history = [depth_1[0]] * 6
+    run_inference(model, processor, rgb_history, depth_history, instruction)
