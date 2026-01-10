@@ -38,7 +38,7 @@
 </p>
 
 ## 🔥 News
-### The source code will coming soon...
+### Some implementation details will coming soon...
 <!-- 
 
 ## 🔥 News
