@@ -5,6 +5,11 @@ from PIL import Image
 import requests
 import numpy as np
 from io import BytesIO
+import sys
+current_path = os.path.abspath(__file__)
+inference_dir = os.path.dirname(current_path)
+project_root = os.path.dirname(inference_dir)
+sys.path.append(project_root)
 from utils.utils import prepare_inputs_for_generate
 # 引入定义好的模型类
 try:
@@ -112,8 +117,8 @@ def run_inference():
     model, processor, qformer_tokenizer = load_combined_model()
 
     # 准备测试数据 (通用)
-    img_path = "test_data/rgb/step_0_depth_with_points.jpg"
-    depth_path = "test_data/depth/step_0_depth.png"
+    img_path = "test_data/rgb.jpg"
+    depth_path = "test_data/depth.jpg"
     raw_image = Image.open(img_path).convert("RGB")
 
     # 准备深度图 (如果没有，用纯黑替代测试)
@@ -126,7 +131,7 @@ def run_inference():
     print("测试 1: RVLN 导航指令预测")
     print("="*40)
     
-    instruction = "Go around the right side of the center unit and stop by the right side doorway with the dining table and mirror in it."
+    instruction = "go to the bedroom and the mirror is in front of you."
     
     # 模拟 RVLN 输入队列 (假设只有当前帧)
     rgb_queue = [raw_image]
@@ -164,7 +169,7 @@ def run_inference():
     test_texts = [
         "A photo of two cats sleeping on a sofa.", 
         "A red sports car driving on the highway", 
-        "white kitchen with a dining table and a door." 
+        instruction 
     ]
     
     

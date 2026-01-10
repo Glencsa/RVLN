@@ -3,6 +3,11 @@ import torch
 import numpy as np
 from PIL import Image
 from transformers import InstructBlipProcessor
+import sys
+current_path = os.path.abspath(__file__)
+inference_dir = os.path.dirname(current_path)
+project_root = os.path.dirname(inference_dir)
+sys.path.append(project_root)
 from utils.utils import prepare_inputs_for_generate
 try:
     from models.rvln import RvlnMultiTask
@@ -13,7 +18,7 @@ except ImportError:
 CHECKPOINT_PATH = "output/rvln_merged_final"  
 stage1_checkpoint = "output/stage1_checkpoint/latest_checkpoint.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.float16  # 3090/4090/A100 必选 bf16
+DTYPE = torch.float16  
 
 def load_model():
     print(f"Loading model from: {CHECKPOINT_PATH}")

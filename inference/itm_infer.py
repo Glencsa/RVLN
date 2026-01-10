@@ -5,7 +5,10 @@ from PIL import Image
 import requests
 import numpy as np
 import cv2
-
+current_path = os.path.abspath(__file__)
+inference_dir = os.path.dirname(current_path)
+project_root = os.path.dirname(inference_dir)
+sys.path.append(project_root)
 from models.depth_estimate import DepthEstimator
 from models.rvln import RvlnMultiTask
 from transformers import (
