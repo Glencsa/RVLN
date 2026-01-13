@@ -60,5 +60,3 @@ logs/
 lora_weight/
 test.jpeg
 test_data/
-
-VLN-CE/*
