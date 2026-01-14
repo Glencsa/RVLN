@@ -227,6 +227,7 @@ class WeightedTrainer(Trainer):
 def main():
     # =================Configuration=================
     model_name_or_path = "./instructblip-vicuna-7b" 
+    depth_encoder_path = "./vit-base-patch16-224"
     # Weight: Fusion, Q-Former, Depth
     stage1_checkpoint = "checkpoints/latest_checkpoint.pth"
     data_path = "/home/guanbin/scratch/dataset/r2r_dataset/rgb_images_r2r_train.json"
@@ -235,7 +236,7 @@ def main():
     batch_size = 4 
     grad_accumulation = 8 # 稍微加大累积，模拟更大 batch
     learning_rate = 2e-4  # SFT LLM 学习率
-    num_epochs = 10
+    num_epochs = 50
     lora_rank = 32
     lora_alpha = 64
     
@@ -259,7 +260,7 @@ def main():
     config = InstructBlipConfig.from_pretrained(model_name_or_path)
     config.history_token_id = history_token_id
     config.current_token_id = current_token_id
-
+    config.depth_model_name_or_path = depth_encoder_path
     # 加载基础模型
     model = RvlnMultiTask.from_pretrained(
         model_name_or_path,
@@ -298,7 +299,7 @@ def main():
         lora_dropout=0.05,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
-        modules_to_save=["embed_tokens", "lm_head"]# "score_head" 
+        modules_to_save=["embed_tokens", "lm_head"]
     )
     
     print("Applying LoRA to LLM...")

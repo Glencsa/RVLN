@@ -13,7 +13,7 @@ import random
 import sys
 from PIL import Image
 import cv2
-from point_project import process_depth_rgb_simple
+from point_project import process_depth_rgb_simple,process_depth_rgb_highlight
 
 # 添加项目根目录到 Python 路径
 current_path = os.path.abspath(__file__)
@@ -350,32 +350,20 @@ class RVLN_Agent(Agent):
         # 添加投影逻辑
         # rgb=cv2.imread(rgb)
         # depth=cv2.imread(depth, cv2.IMREAD_ANYDEPTH)
-        rgb,points_3d,point_ids=process_depth_rgb_simple(depth,rgb)
+        rgb_point,points_3d,point_ids=process_depth_rgb_simple(depth,rgb)
         
         depth=normalize_depth_for_vis(depth)
-        cv2.imwrite("debug_rgb.png",rgb)
+        cv2.imwrite("debug_rgb.png",rgb_point)
         cv2.imwrite("debug_depth.png",depth)
 
        
         # 处理观测
-        self.process_observations(rgb, depth)
+        self.process_observations(rgb_point, depth)
         
-        # 生成可视化图像（与 NaVid 一致）
-        if self.require_map:
-            top_down_map = maps.colorize_draw_agent_and_fit_to_height(
-                info["top_down_map_vlnce"], rgb.shape[0]
-            )
-            # 拼接 RGB 和 top-down map
-            output_im = np.concatenate((rgb, top_down_map), axis=1)
         
         # 如果有待执行的动作，优先执行（与 NaVid 完全一致）
         if len(self.pending_action_list) != 0:
             temp_action = self.pending_action_list.pop(0)
-            
-            if self.require_map:
-                img = self.addtext(output_im, observations["instruction"]["text"], 
-                                 f"Pending action: {temp_action}")
-                self.topdown_map_list.append(img)
             
             return {"action": temp_action}
         
@@ -385,10 +373,20 @@ class RVLN_Agent(Agent):
 
         route_number, output_text = self.predict_route(instruction)
         print(f"[RVLN Agent] Predicted route number: {route_number}")
-
-        
         # 生成可视化文本
         navigation_text = f"Route: {route_number} | {output_text}"
+        # 生成可视化图像（与 NaVid 一致）
+        if self.require_map:
+            top_down_map = maps.colorize_draw_agent_and_fit_to_height(
+                info["top_down_map_vlnce"], rgb.shape[0]
+            )
+            # 拼接 RGB 和 top-down map
+            rgb =process_depth_rgb_highlight(depth,rgb,selected_ids=[route_number])
+            output_im = np.concatenate((rgb, top_down_map), axis=1)
+        if self.require_map:
+            img = self.addtext(output_im, observations["instruction"]["text"],navigation_text)
+            self.topdown_map_list.append(img)
+
         
         if self.require_map:
             img = self.addtext(output_im, instruction, navigation_text)

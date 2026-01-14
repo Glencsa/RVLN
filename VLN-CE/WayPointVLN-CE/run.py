@@ -3,7 +3,7 @@
 import argparse
 from habitat.datasets import make_dataset
 from VLN_CE.vlnce_baselines.config.default import get_config
-
+import glob
 from habitat import Env
 from tqdm import trange
 import json
@@ -96,17 +96,37 @@ def run_exp(exp_config: str, split_num: str, split_id: str, model_path: str, res
   
   
 def evaluate_agent(config, split_id, dataset, model_path, result_path, model_name, exp_save) -> None:
- 
+    log_dir = os.path.join(result_path, "log")
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True) # 确保目录存在，防止报错
+    
+    # 1. 获取已经完成的 episode ID
+    finished_ids = set()
+    # 假设文件名格式是 stats_{episode_id}.json
+    existing_files = glob.glob(os.path.join(log_dir, "stats_*.json"))
+    
+    for f in existing_files:
+        filename = os.path.basename(f)
+        # 解析 ID: "stats_123.json" -> "123"
+        ep_id = filename.replace("stats_", "").replace(".json", "")
+        finished_ids.add(ep_id)
+        
+    # 2. 过滤掉已经跑过的 episode
+    # 注意：Habitat 的 episode_id 通常是字符串，确保类型匹配
+    original_count = len(dataset.episodes)
+    dataset.episodes = [ep for ep in dataset.episodes if str(ep.episode_id) not in finished_ids]
+    
+    skipped_count = original_count - len(dataset.episodes)
+    if skipped_count > 0:
+        print(f"Found existing results. Resuming... Skipped {skipped_count} episodes. Remaining: {len(dataset.episodes)}")
+    # -------------------------
+
+    # 如果所有都跑完了，直接返回，避免 Env 报错
+    if len(dataset.episodes) == 0:
+        print("All episodes in this split are already finished.")
+        return
     env = Env(config.TASK_CONFIG, dataset)
 
-    if model_name == "navid":
-        from agent_navid import NaVid_Agent
-        agent = NaVid_Agent(model_path, result_path, exp_save)
-        
-    elif model_name == "uni-navid":
-        from agent_uninavid import UniNaVid_Agent
-        agent = UniNaVid_Agent(model_path, result_path, exp_save)
-    
     if model_name == "rvln":
         from agent_rvln import RVLN_Agent
         agent = RVLN_Agent(model_path, result_path, exp_save)

@@ -708,6 +708,7 @@ class DepthToRGBGroundMask:
             )
 
 
+
 def main():
     """
     主函数 - 示例用法
@@ -838,7 +839,71 @@ def process_depth_rgb_simple(depth_image, rgb_image,
     )
     
     return result_image, sampled_points_3d, sampled_point_ids
+def process_depth_rgb_highlight(depth_image, rgb_image, selected_ids,
+                            fx=320.0, fy=320.0, cx=319.5, cy=239.5,
+                            depth_scale=10.0, camera_height=2.4,
+                            num_samples=7,
+                            normal_radius=11, highlight_radius=11,
+                            normal_color=(255, 0, 0), highlight_color=(0, 255, 0),
+                            font_scale=1.0, thickness=3):
 
+    # 规范化选中集合
+    sel_set = set(int(x) for x in (selected_ids or []))
+
+    # 创建处理器（不保存任何文件）
+    processor = DepthToRGBGroundMask(
+        fx=fx, fy=fy, cx=cx, cy=cy,
+        depth_scale=depth_scale,
+        camera_height=camera_height,
+        num_boundary_samples=num_samples,
+        save_colored_pcd=False,
+        save_ground_annotated_pcd=False,
+        save_colored_depth=False,
+        save_sampled_rgb=False
+    )
+
+    # 转点云、检测地面、采样
+    points, colors, valid_u, valid_v = processor.depth_to_pointcloud(depth_image, rgb_image)
+    ground_mask, plane_model = processor.detect_ground_plane(points, colors)
+    sampled_points_3d, sampled_point_ids = processor.sample_ground_boundary_points(points, ground_mask, num_samples=num_samples)
+
+    # 投影并绘制（高亮所选）
+    result_image = rgb_image.copy()
+    if len(sampled_points_3d) == 0:
+        return result_image, sampled_points_3d, sampled_point_ids
+
+    image_points, valid_mask = processor.project_3d_to_image(sampled_points_3d)
+
+    font_face = cv2.FONT_HERSHEY_SIMPLEX
+    for i in range(len(sampled_points_3d)):
+        if not valid_mask[i]:
+            continue
+        point_id = int(sampled_point_ids[i])
+        center = (int(round(image_points[i, 0])), int(round(image_points[i, 1])))
+        # 检查是否在图像范围内
+        h, w = rgb_image.shape[:2]
+        if center[0] < 0 or center[0] >= w or center[1] < 0 or center[1] >= h:
+            continue
+
+        if point_id in sel_set:
+            color = highlight_color
+            radius = highlight_radius
+            text_thickness = max(2, thickness)
+        else:
+            color = normal_color
+            radius = normal_radius
+            text_thickness = thickness
+
+        # 圆点（填充）
+        cv2.circle(result_image, center, radius, color, -1)
+
+        # 文本（居中于圆上方）
+        point_text = str(point_id)
+        text_size = cv2.getTextSize(point_text, font_face, font_scale, text_thickness)[0]
+        text_org = (int(center[0] - text_size[0] / 2), int(center[1] - radius - 4))
+        cv2.putText(result_image, point_text, text_org, font_face, font_scale, color, text_thickness, cv2.LINE_AA)
+
+    return result_image
 
 def process_depth_rgb_with_ground(depth_image, rgb_image, 
                                    fx=320.0, fy=320.0, cx=319.5, cy=239.5,

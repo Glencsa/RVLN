@@ -7,6 +7,7 @@ from transformers import (
     InstructBlipConfig, 
     ViTModel
 )
+from models.fusion_depth import DepthCrossAttentionFusion
 
 class DepthCrossAttentionFusion(nn.Module):
     def __init__(self, rgb_dim, depth_dim, num_heads=8, dropout=0.1):
@@ -80,17 +81,16 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
             raise ValueError("Config must contain 'current_token_id'")
         
         # 我们使用 ImageNet 预训练的 ViT-Base 来提取深度图特征
-        depth_encoder_name = "/home/isvl/guan_code/RVLN/vit-base-patch16-224"
-        print(f"Loading Depth Encoder: {depth_encoder_name}...")
-        self.depth_backbone = ViTModel.from_pretrained(depth_encoder_name, add_pooling_layer=False)
-        
+        depth_model_name = getattr(config, "depth_model_name_or_path", "google/vit-base-patch16-224")
+        print(f"Building Depth Backbone structure from: {depth_model_name}")
+        depth_config = ViTConfig.from_pretrained(depth_model_name)
+        depth_config.add_pooling_layer = False
+        self.depth_backbone = ViTModel(depth_config)
         # 冻结深度编码器参数
         for param in self.depth_backbone.parameters():
             param.requires_grad = False
             
-        # === 定义 decay_rate ===
         self.decay_rate = 0.8
-
         self.rgb_hidden_size = config.vision_config.hidden_size # 1408
         self.depth_hidden_size = self.depth_backbone.config.hidden_size # 768 (ViT-Base)
         self.qformer_hidden_size = config.qformer_config.hidden_size
