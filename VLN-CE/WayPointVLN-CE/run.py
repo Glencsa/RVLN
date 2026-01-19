@@ -127,7 +127,7 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
         return
     env = Env(config.TASK_CONFIG, dataset)
 
-    if model_name == "rvln":
+    if model_name == "RVLN":
         from agent_rvln import RVLN_Agent
         agent = RVLN_Agent(model_path, result_path, exp_save)
 

@@ -5,12 +5,12 @@ CHUNKS=1
 ################ NaVid ################
 
 MODEL_PATH="/home/isvl/guan_code/WayPoint-VLN/output/rvln_merged_final" 
-MODEL_NAME="rvln" # uni-navid or navid
+MODEL_NAME="RVLN" # uni-navid or navid
 EXP_SAVE="video-data" # use "data" to accelerate evaluation
 
 #R2R
 CONFIG_PATH="VLN_CE/vlnce_baselines/config/r2r_baselines/navid_r2r.yaml"
-SAVE_PATH="tmp/rvln" 
+SAVE_PATH="tmp/WayPointVLN" 
 
 
 #RxR

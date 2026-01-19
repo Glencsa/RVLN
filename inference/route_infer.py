@@ -15,7 +15,7 @@ except ImportError:
     raise ImportError("请确保 models/rvln.py 存在，并且其中定义了 RvlnMultiTask 类。")
 
 
-CHECKPOINT_PATH = "output/rvln_merged_final"  
+CHECKPOINT_PATH = "output/rvln_merged_final_116"  
 stage1_checkpoint = "output/stage1_checkpoint/latest_checkpoint.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16  
@@ -59,10 +59,15 @@ def load_model():
             model.query_tokens.data = checkpoint['query_tokens'].data.to(DEVICE)
         else :
             print("   ⚠️ 警告: ITM 权重中未找到 query_tokens 部分，跳过该部分加载。")
+
+            
+    if hasattr(model, 'depth_model'):
+        model.depth_model.to(dtype=torch.float32)
     model.eval()
     # model_emb_size = model.language_model.get_input_embeddings().weight.shape[0]
     # print(f"   -> Model Embedding Size: {model_emb_size}")
     # model.language_model.resize_token_embeddings(len(tokenizer))
+
     print("Model loaded successfully!")
     return model, processor
 

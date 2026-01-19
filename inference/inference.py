@@ -25,7 +25,7 @@ from transformers import (
 
 # ================= 配置区域 =================
 # RVLN 合并后的权重路径 (用于 Task 1 生成)
-RVLN_MODEL_PATH = "output/rvln_merged_final"
+RVLN_MODEL_PATH = "output/rvln_merged_final_116"
 # 基础 Vicuna 路径 (用于加载 Processor)
 BASE_PROCESSOR_PATH = "./instructblip-vicuna-7b"
 # ITM / Stage1 权重路径 (用于 Task 2 ITM)

@@ -62,20 +62,8 @@ class RVLN_Agent(Agent):
                 self.model_path,
                 torch_dtype=self.dtype,
             ).to(self.device)
-            stage1_checkpoint = "/home/isvl/guan_code/WayPoint-VLNoutput/stage1_checkpoint/latest_checkpoint.pth"
-            if os.path.exists(stage1_checkpoint):
-                print(f"📥 Loading Stage 1 Checkpoint from: {stage1_checkpoint}")
-                ckpt = torch.load(stage1_checkpoint, map_location="cpu")
-
-                msg = self.model.load_state_dict(ckpt, strict=False)
-                print(f"Checkpoint Load Status: {msg}")
-                
-                if 'visual_fusion' in ckpt: print(" - Visual Fusion Loaded ✅")
-                if 'qformer' in ckpt: print(" - Q-Former Loaded ✅")
-                if 'depth_backbone' in ckpt: print(" - Depth Backbone Loaded ✅")
-            else:
-                print("❌ Warning: Stage 1 checkpoint not found! Training from scratch (Not Recommended).")
-
+            if hasattr(self.model, 'depth_model'):
+                self.model.depth_model.to(dtype=torch.float32)
             self.model.eval()
             
             print("RVLN Agent Initialization Complete")
@@ -243,9 +231,8 @@ class RVLN_Agent(Agent):
         match = re.search(r"(-?\d+)", output_text)
         if match:
             return int(match.group(1))
-        
-        # 默认返回 -1 (停止)
-        return -1
+
+        return -2
     
     def route_to_actions(self, route_number):
         """
@@ -287,7 +274,7 @@ class RVLN_Agent(Agent):
         elif route_number == 8:
             action_list.extend([3, 3, 3, 3])  # 右, 右, 右, 右, 前
         else:
-            action_list.extend([random.randint(1, 3) for _ in range(random.randint(1, 3))])  # 默认1-3随机数
+            action_list.extend([random.randint(1, 3) for _ in range(random.randint(1, 3))]) 
         return action_list
     
     def addtext(self, image, instruction, navigation):
