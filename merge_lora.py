@@ -2,7 +2,7 @@ import os
 import torch
 from transformers import InstructBlipProcessor, InstructBlipConfig
 from peft import PeftModel
-from models.rvln import RvlnMultiTask  # 确保能导入你的自定义模型类
+from models.WayPointVLN import RvlnMultiTask  # 确保能导入你的自定义模型类
 
 def merge_lora():
     # ================= 配置路径 =================

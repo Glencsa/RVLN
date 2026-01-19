@@ -13,7 +13,7 @@ sys.path.append(project_root)
 from utils.utils import prepare_inputs_for_generate
 # 引入定义好的模型类
 try:
-    from models.rvln import RvlnMultiTask
+    from models.WayPointVLN import RvlnMultiTask
 except ImportError:
     raise ImportError("请确保 models/rvln.py 存在，并且其中定义了 RvlnMultiTask 类。")
 

@@ -50,24 +50,16 @@ class DepthCrossAttentionFusion(nn.Module):
         nn.init.constant_(self.cross_attn.out_proj.bias, 0)
 
     def forward(self, rgb_embeds, depth_embeds):
-        # 1. 投影并归一化 Depth
         depth_feat = self.depth_proj(depth_embeds)
         depth_feat = self.norm_depth(depth_feat)
-        
-        # 2. 归一化 RGB (作为 Query)
         rgb_feat_norm = self.norm_rgb(rgb_embeds)
-        
-        # 3. Cross Attention 计算
         attn_output, _ = self.cross_attn(
             query=rgb_feat_norm,
             key=depth_feat,
             value=depth_feat
         )
-        
-        # 4. 残差连接 + FFN
         rgb_fused = rgb_embeds + self.dropout(attn_output)
         rgb_fused = rgb_fused + self.dropout(self.ffn(self.norm_ffn(rgb_fused)))
-        
         return rgb_fused
 
     
@@ -75,19 +67,16 @@ class DepthCrossAttentionFusion(nn.Module):
 class RvlnMultiTask(InstructBlipForConditionalGeneration):
     def __init__(self, config: InstructBlipConfig):
         super().__init__(config)
-        # 检查 Config
         if not hasattr(config, 'history_token_id') or config.history_token_id is None:
             raise ValueError("Config must contain 'history_token_id'")
         if not hasattr(config, 'current_token_id') or config.current_token_id is None:
             raise ValueError("Config must contain 'current_token_id'")
-        
-        # 我们使用 ImageNet 预训练的 ViT-Base 来提取深度图特征
         depth_model_name = getattr(config, "depth_model_name_or_path", "google/vit-base-patch16-224")
         print(f"Building Depth Backbone structure from: {depth_model_name}")
         depth_config = ViTConfig.from_pretrained(depth_model_name)
         depth_config.add_pooling_layer = False
         self.depth_backbone = ViTModel(depth_config)
-        # 冻结深度编码器参数
+
         for param in self.depth_backbone.parameters():
             param.requires_grad = False
             
@@ -123,7 +112,6 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
         """
         b, num_images, c, h, w = pixel_values.shape
         
-        # 1. 展平并提取 RGB 特征
         flat_pixel_values = pixel_values.view(b * num_images, c, h, w)
         rgb_outputs = self.vision_model(
             pixel_values=flat_pixel_values,
@@ -131,14 +119,10 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
         )
         rgb_embeds = rgb_outputs.last_hidden_state # [B*5, N_patches, 1408]
 
-        # 2. 展平并提取 Depth 特征
         flat_depth_values = depth_pixel_values.view(b * num_images, -1, h, w)
-        
-        # 兼容性处理
         if flat_depth_values.shape[1] == 1:
             flat_depth_values = flat_depth_values.repeat(1, 3, 1, 1)
         
-        # 确保类型一致
         flat_depth_values = flat_depth_values.to(dtype=self.depth_backbone.dtype)
 
         # with torch.no_grad():
@@ -149,29 +133,23 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
         if depth_raw.dtype != rgb_embeds.dtype:
             depth_raw = depth_raw.to(rgb_embeds.dtype)
 
-        # 3. 融合 RGB 和 Depth
         image_embeds = self.visual_fusion(rgb_embeds, depth_raw)
         target_device = image_embeds.device  
 
-        # 4. 准备 Q-Former 输入
         image_attention_mask = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=target_device)
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1).to(target_device)
         
-        # 将输入数据移动到 target_device 上
         flat_qformer_input_ids = qformer_input_ids.unsqueeze(1).repeat(1, num_images, 1).view(b * num_images, -1).to(target_device)
         flat_qformer_attention_mask = qformer_attention_mask.unsqueeze(1).repeat(1, num_images, 1).view(b * num_images, -1).to(target_device)
 
-        # 创建 query mask (也在 target_device)
         query_attention_mask = torch.ones(
             (b * num_images, query_tokens.shape[1]),
             dtype=torch.long,
             device=target_device 
         )
         
-        # 现在 concat 就不会报错了，因为两者都在 target_device 上
         qformer_attention_mask_full = torch.cat([query_attention_mask, flat_qformer_attention_mask], dim=1)
-        
-        # 5. Q-Former 前向传播
+
         query_outputs = self.qformer(
             input_ids=flat_qformer_input_ids,
             attention_mask=qformer_attention_mask_full,
@@ -182,30 +160,24 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
         )
         
         qformer_output = query_outputs.last_hidden_state
-        
-        # 截断与投影
+
         num_queries = self.query_tokens.shape[1] 
         qformer_output = qformer_output[:, :num_queries, :] 
         qformer_output = self.language_projection(qformer_output)
 
-        # 6. 时序衰减与重组
         qformer_output = qformer_output.view(b, num_images, num_queries, qformer_output.shape[-1])
         
         _, num_frames, _, _ = qformer_output.shape
         decay_factors = torch.tensor([self.decay_rate ** (num_frames - 1 - i) for i in range(num_frames)])
-        # 确保 decay_factors 也在正确的设备和 dtype 上
         decay_factors = decay_factors.view(1, num_frames, 1, 1).to(device=target_device, dtype=qformer_output.dtype)
 
         qformer_output = qformer_output * decay_factors
-
-        # 切片
         history_feats = qformer_output[:, :4, :, :].flatten(1, 2)
         current_feats = qformer_output[:, 4:, :, :].flatten(1, 2)
         
         return history_feats, current_feats
 
     def _replace_image_tokens(self, inputs_embeds, input_ids, history_feats, current_feats, history_token_id, current_token_id):
-        # 强制类型一致
         history_feats = history_feats.to(inputs_embeds.dtype)
         current_feats = current_feats.to(inputs_embeds.dtype)
         
@@ -245,7 +217,6 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
             labels: torch.LongTensor = None,
             **kwargs
         ):
-            # 1. 传入 depth_pixel_values
             history_feats, current_feats = self.get_fused_visual_features(
                 pixel_values, depth_pixel_values, qformer_input_ids, qformer_attention_mask
             )
@@ -254,7 +225,6 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
             current_token_id = self.config.current_token_id
             
             inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
-            # （guanbin）传入的是4个history，1个current的标签？
             inputs_embeds = self._replace_image_tokens(
                 inputs_embeds, input_ids, 
                 history_feats, current_feats, 
@@ -310,78 +280,43 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
     
     def forward_itm(self, pixel_values, depth_pixel_values, input_ids, attention_mask):
         """
-        Image-Text Matching 前向传播
-        pixel_values:       [B, C, H, W] 或 [B, N, C, H, W]
-        depth_pixel_values: [B, 1(or 3), H, W] 或 [B, N, 1(or 3), H, W]
-        input_ids:          [B, Seq_Len] (文本)
+        Image-Text Matching 
+        pixel_values:       [B, C, H, W] | [B, N, C, H, W]
+        depth_pixel_values: [B, 1(or 3), H, W] | [B, N, 1(or 3), H, W]
+        input_ids:          [B, Seq_Len] 
         attention_mask:     [B, Seq_Len]
         """
-        # 1. 动态处理维度 (兼容单图或多图序列)
-        # 获取最后三个维度 (C, H, W)
         c, h, w = pixel_values.shape[-3:]
         
-        # 将 Batch 和 Num_Images (如果有) 展平，以便统一处理
         # [B, C, H, W] -> [B, C, H, W]
         # [B, N, C, H, W] -> [B*N, C, H, W]
         flat_pixel_values = pixel_values.view(-1, c, h, w)
         
-        # 2. RGB 特征提取
         rgb_outputs = self.vision_model(
             pixel_values=flat_pixel_values,
             return_dict=True,
         )
         rgb_embeds = rgb_outputs.last_hidden_state # [B_flat, N_patches, 1408]
 
-        # 3. Depth 特征提取
-        # 同样展平深度图
         d_c = depth_pixel_values.shape[-3]
         flat_depth_values = depth_pixel_values.view(-1, d_c, h, w)
         
-        # 兼容性处理：如果深度图是单通道，复制为 3 通道以适配 ViT 权重
         if flat_depth_values.shape[1] == 1:
             flat_depth_values = flat_depth_values.repeat(1, 3, 1, 1)
         
-        # 确保类型一致 (转为 depth backbone 的 dtype，通常是 float32 或 bfloat16)
         flat_depth_values = flat_depth_values.to(dtype=self.depth_backbone.dtype)
 
-        # with torch.no_grad():
-        # self.depth_backbone.eval()
-        # 通过 ViT Encoder
         depth_outputs = self.depth_backbone(pixel_values=flat_depth_values, return_dict=True)
         depth_raw = depth_outputs.last_hidden_state # [B_flat, N_patches, 768]
         
-        # 确保与 RGB 特征类型一致以便融合
         if depth_raw.dtype != rgb_embeds.dtype:
             depth_raw = depth_raw.to(rgb_embeds.dtype)
 
-        # 4. Cross Attention 融合
         image_embeds = self.visual_fusion(rgb_embeds, depth_raw)
-
-        # 5. 准备 Q-Former 输入
-        # 这里需要注意：如果输入是多图，ITM 通常是对整个序列做匹配，或者每张图单独做
-        # 这里假设 input_ids 对应的是这一组图的文本
-        
-        # 恢复 Batch 维度用于 Q-Former
-        # image_embeds: [B_total, N_patches, Dim]
-        # 扩展 Query Tokens: [1, N_query, Dim] -> [B_total, N_query, Dim]
         batch_size_total = image_embeds.shape[0]
         query_tokens = self.query_tokens.expand(batch_size_total, -1, -1)
         
         image_attention_mask = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=image_embeds.device)
-
-        # 处理文本的 Attention Mask
-        # input_ids: [B, Seq_Len]
-        # 我们需要让 input_ids 扩展到与 flat_pixel_values 相同的 batch 大小
-        # 例如：如果是 5 张图对应 1 句话，我们需要把这句话复制 5 次来和每张图做 Q-Former 交互
-        # 或者 InstructBlip 原生逻辑可能是把 5 张图特征拼起来。
-        
-        # === 关键逻辑分支 ===
-        # 为了保证与 forward() 的行为一致性，以及 ITM 的物理意义
-        # 这里我们采取“每张图分别提取 Query 特征，然后 Mean Pooling”的策略
-        # 这与 InstructBlip 原版逻辑较为接近
-        
-        # 扩展 input_ids 以匹配展平后的图像数量
-        # 计算每条数据包含几张图
         num_images_per_sample = batch_size_total // input_ids.shape[0]
         
         if num_images_per_sample > 1:
@@ -392,7 +327,6 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
             flat_input_ids = input_ids
             flat_attention_mask = attention_mask
 
-        # Q-Former 内部 Mask
         query_attention_mask = torch.ones(
             (batch_size_total, query_tokens.shape[1]), 
             dtype=torch.long, 
@@ -400,7 +334,6 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
         )
         qformer_attention_mask = torch.cat([query_attention_mask, flat_attention_mask], dim=1)
         print("input:", flat_input_ids)
-        # 6. Q-Former 前向传播
         query_outputs = self.qformer(
             input_ids=flat_input_ids,
             attention_mask=qformer_attention_mask,
@@ -409,11 +342,11 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
             encoder_attention_mask=image_attention_mask,
             return_dict=True,
         )
-        print("query_outputs:", query_outputs)
+        # print("query_outputs:", query_outputs)
         # [B_total, 32 + Seq_Len, 768]
         qformer_features = query_outputs.last_hidden_state
         
-        # 只取 Visual Query 部分做分类 (前32个)
+        # Use Visual Query [:32]
         num_queries = self.query_tokens.shape[1]
         qformer_features = qformer_features[:, :num_queries, :] # [B_total, 32, 768]
         all_logits = self.itm_head(qformer_features) # [B_total, 32, 2]
@@ -421,9 +354,6 @@ class RvlnMultiTask(InstructBlipForConditionalGeneration):
 
         
         if num_images_per_sample > 1:
-            # 如果是多帧，现在 itm_logits 是每一帧的平均分
-            # 我们再对帧维度取平均
-            # [B * N, 2] -> [B, N, 2] -> [B, 2]
             itm_logits = itm_logits.view(-1, num_images_per_sample, 2)
             itm_logits = torch.mean(itm_logits, dim=1)
         

@@ -43,21 +43,14 @@ class DepthCrossAttentionFusion(nn.Module):
         nn.init.constant_(self.cross_attn.out_proj.bias, 0)
 
     def forward(self, rgb_embeds, depth_embeds):
-        # 1. 投影并归一化 Depth
         depth_feat = self.depth_proj(depth_embeds)
         depth_feat = self.norm_depth(depth_feat)
-        
-        # 2. 归一化 RGB (作为 Query)
         rgb_feat_norm = self.norm_rgb(rgb_embeds)
-        
-        # 3. Cross Attention 计算
         attn_output, _ = self.cross_attn(
             query=rgb_feat_norm,
             key=depth_feat,
             value=depth_feat
         )
-        
-        # 4. 残差连接 + FFN
         rgb_fused = rgb_embeds + self.dropout(attn_output)
         rgb_fused = rgb_fused + self.dropout(self.ffn(self.norm_ffn(rgb_fused)))
         

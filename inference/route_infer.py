@@ -10,7 +10,7 @@ project_root = os.path.dirname(inference_dir)
 sys.path.append(project_root)
 from utils.utils import prepare_inputs_for_generate
 try:
-    from models.rvln import RvlnMultiTask
+    from models.WayPointVLN import RvlnMultiTask
 except ImportError:
     raise ImportError("请确保 models/rvln.py 存在，并且其中定义了 RvlnMultiTask 类。")
 

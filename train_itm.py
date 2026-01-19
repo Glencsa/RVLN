@@ -7,7 +7,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
 from transformers import InstructBlipProcessor, BertTokenizer,InstructBlipConfig
 from transformers import AutoTokenizer
-from models.rvln import RvlnMultiTask 
+from models.WayPointVLN import RvlnMultiTask 
 from models.depth_estimate import DepthEstimator
 import swanlab
 

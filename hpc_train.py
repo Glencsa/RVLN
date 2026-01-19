@@ -17,7 +17,7 @@ from peft import (
     get_peft_model,
     TaskType
 )
-from models.rvln import RvlnMultiTask 
+from models.WayPointVLN import RvlnMultiTask 
 from utils.data_utils import RvlnLoRADataset, DataCollatorForRvln
 from utils.utils import *
 

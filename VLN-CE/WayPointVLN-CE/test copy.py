@@ -31,7 +31,7 @@ current_file_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_file_dir)
 
 from transformers import InstructBlipProcessor
-from models.rvln import RvlnMultiTask
+from models.WayPointVLN import RvlnMultiTask
 from utils.utils import prepare_inputs_for_generate
 
 # 确保结果根目录存在（启动即创建）

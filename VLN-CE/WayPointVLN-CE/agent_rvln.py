@@ -21,7 +21,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_path)))
 sys.path.insert(0, project_root)
 
 from transformers import InstructBlipProcessor
-from models.rvln import RvlnMultiTask
+from models.WayPointVLN import RvlnMultiTask
 from utils.utils import prepare_inputs_for_generate
 
 
