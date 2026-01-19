@@ -37,9 +37,12 @@
   </a>
 </p>
 
-## Model Architecture
-![](Archi.drawio.png)
-## 🔥 News
-### Some implementation details will coming soon...
+###  Model Architecture
+![](assets/Archi.drawio.png)
+###  🔥 News
+1. Our RealWorld Deployment is in this Repo(https://github.com/zzywhu/Robust-VL-N).
+
+2. Some implementation details will coming soon...
+
 
 
